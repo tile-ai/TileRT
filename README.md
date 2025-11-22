@@ -79,13 +79,13 @@ Before installing the TileRT wheel package, please ensure your environment meets
 To get started, pull the Docker image:
 
 ```bash
-docker pull tile-ai/tilert:v0.1.0
+docker pull tileai/tilert:v0.1.0
 ```
 
 Then, launch a Docker container using the following command:
 
 ```bash
-IMAGE_NAME="tile-ai/tilert:v0.1.0"
+IMAGE_NAME="tileai/tilert:v0.1.0"
 WORKSPACE_PATH="xxx"  # Path to the workspace you want to mount
 
 docker run --gpus all -it \
