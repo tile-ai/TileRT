@@ -94,7 +94,10 @@ class WeightLoader:
             self.weights_dict_golden.update(weights_config)
 
     def check_shape(
-        self, data_shape: torch.Size, config_shape: tuple[int, ...], split_method: str = "no_split"
+        self,
+        data_shape: torch.Size,
+        config_shape: tuple[int, ...],
+        split_method: str = "no_split",
     ) -> None:
         """Check if the shape of the data is the same as the shape in the weights configuration.
 
@@ -227,8 +230,3 @@ class WeightLoader:
             raise ValueError("Golden weights not loaded. Call load_weights first.")
 
         return weight_dict[name]["data"]
-
-
-if __name__ == "__main__":
-    weights_path = "/data2/shared/deepseekv3.1_layers/deepseekv3.1.layer_0.weights.pt"
-    print_weights_info(weights_path)

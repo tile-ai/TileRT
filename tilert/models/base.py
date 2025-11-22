@@ -38,7 +38,8 @@ class TileRTModule(nn.Module, ABC):
 
         Args:
             op_name: Optional operation name. Defaults to class name.
-            weights_path: Optional path to weights directory.
+            golden_weights_dir: Optional path to golden weights directory.
+            tilert_weights_path: Optional path to tilert weights directory.
             layer_idx: Layer index.
             *args: Additional positional arguments.
             **kwargs: Additional keyword arguments.
@@ -223,7 +224,7 @@ class TileRTModule(nn.Module, ABC):
         """
         for module in self.modules():
             if isinstance(module, TileRTModule):
-                print(f"Enable profiling for {module.__class__.__name__}")
+                logger.info(f"Enable profiling for {module.__class__.__name__}")
                 module.flag_enable_profiling_log = enable
 
     def enable_external_profiling_log(self, enable: bool = True) -> None:
@@ -234,26 +235,13 @@ class TileRTModule(nn.Module, ABC):
         """
         for module in self.modules():
             if isinstance(module, TileRTModule):
-                print(f"Enable external profiling for {module.__class__.__name__}")
+                logger.info(f"Enable external profiling for {module.__class__.__name__}")
                 module.flag_enable_external_profiling_log = enable
 
     def enable_tilert(self, enable: bool = True) -> None:  # type: ignore
         for module in self.modules():
             if isinstance(module, TileRTModule):
-                print(f"Enable tilert for {module.__class__.__name__}")
+                logger.info(f"Enable tilert for {module.__class__.__name__}")
                 module.flag_enable_tilert = enable
                 if enable:
-                    module.convert_weights_to_tilert()
-
-    def convert_weights_to_tilert(self, *args, **kwargs) -> None:  # type: ignore
-        del args, kwargs
-        """
-        Args:
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-
-        Returns:
-            The result of the forward pass.
-        """
-        # TODO(ying): make this an abstract method
-        pass
+                    module.to_tilert_weights()

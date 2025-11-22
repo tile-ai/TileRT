@@ -1,5 +1,6 @@
 """Text generation script for TileRT."""
 
+import math
 import time
 from argparse import ArgumentParser
 
@@ -8,13 +9,27 @@ from transformers import AutoTokenizer
 
 from tilert import logger, tilert_init
 from tilert.models.deepseek_v3_2.model_args import ModelArgs as ModelArgsV3_2
-from tilert.models.deepseek_v3_2.modules.dsa_show_hands import ShowHandsDSALayer, TempVars
+from tilert.models.deepseek_v3_2.modules.dsa_show_hands import (
+    ShowHandsDSALayer,
+    TempVars,
+)
 from tilert.models.deepseek_v3_2.params import IntermediateMapper
 
 __all__ = [
     "ShowHandsGenerator",
     "parse_args",
 ]
+
+
+def stats_time(time_list: list[float], title: str) -> None:
+    if len(time_list) > 0:
+        avg_time = sum(time_list) / len(time_list)
+        # cal std-dev
+        std_dev = math.sqrt(sum((x - avg_time) ** 2 for x in time_list) / len(time_list))
+        logger.info(title)
+        logger.info(f"--Average time taken to generate token: {avg_time * 1000:.4f} ms")
+        logger.info(f"--Standard deviation of time: {std_dev * 1000:.4f} ms")
+        logger.info(f"--Effective tokens per second: {1 / avg_time:.4f}")
 
 
 def parse_args():  # type: ignore
@@ -88,7 +103,10 @@ class ShowHandsGenerator:
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
 
         tokens = torch.full(
-            (self.batch_size, total_len), -1, dtype=torch.long, device=self.default_device
+            (self.batch_size, total_len),
+            -1,
+            dtype=torch.long,
+            device=self.default_device,
         )
         tokens[0, :prompt_len] = torch.tensor(
             prompt_tokens, dtype=torch.long, device=self.default_device
@@ -129,6 +147,10 @@ class ShowHandsGenerator:
 
         print("\n")
         logger.info(f"--Number of tokens generated: {len(time_list)}")
+
+        # skip the first several samples to avoid the warmup effect
+        stats_time(time_list[5:], "==== Performance ====")
+        print("\n")
 
         # Reset sequence after generation, i.e. reset the cur_pos to 0 internally
         self.decode_layer.reset_sequence()
@@ -175,7 +197,6 @@ if __name__ == "__main__":
                 break
             _ = generator.generate(prompt)
     else:
-
         # This prompt is to test the model’s ability to follow instructions
         # (in terms of quantity, type, and length) while keeping it fun.
         prompt = """Tell me three jokes:
