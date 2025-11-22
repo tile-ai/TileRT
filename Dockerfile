@@ -1,7 +1,7 @@
-FROM pytorch/manylinux2_28-builder:cuda12.9-main AS builder
+FROM pytorch/manylinux2_28-builder:cuda12.9-main
 
 RUN yum update -y && \
-    yum install -y epel-release yum-utils && \
+    yum install -y epel-release yum-utils vim && \
     (yum config-manager --set-enabled powertools || \
      yum config-manager --set-enabled crb || true) && \
     yum --enablerepo=epel install -y glog glog-devel && \
@@ -26,7 +26,9 @@ COPY requirements.txt /tmp/requirements.txt
 RUN . /opt/conda/etc/profile.d/conda.sh && \
     conda activate tilert && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
-    rm /tmp/requirements.txt
+    rm /tmp/requirements.txt && \
+    conda clean -afy && \
+    rm -rf /root/.cache/pip
 
 RUN echo "export PATH=\"/opt/conda/bin:\$PATH\"" >> ~/.bashrc && \
     echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \

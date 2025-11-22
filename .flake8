@@ -1,0 +1,37 @@
+[flake8]
+max-line-length = 100
+extend-ignore = E203,W503,E252
+exclude = .git,__pycache__,build,dist,3rd-party
+docstring-convention = google
+ignore =
+    D100,
+    D101,
+    D102,
+    D103,
+    D104,
+    D105,
+    D106,
+    D107,
+    D203,
+    D212,
+    D213,
+    D406,
+    D407,
+    D408,
+    D409,
+    D410,
+    D411,
+    D412,
+    D413,
+    D414,
+    D415,
+    D416,
+    D417,
+    D418,
+    D419,
+    T201,
+    VNE001
+per-file-ignores =
+    __init__.py:F401
+    tests/*:D100,D101,D102,D103
+    setup.py:D100,D101,D102,D103,B009

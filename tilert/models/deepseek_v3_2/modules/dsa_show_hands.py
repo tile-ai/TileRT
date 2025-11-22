@@ -106,13 +106,25 @@ class ShowHandsDSALayer(TileRTModule):
         self.multi_devices_results: list[DeviceResult | None] = [None] * torch.cuda.device_count()
 
         self.kv_cache = torch.zeros(
-            self.batch_size, self.max_seq_len, self.kv_dim, dtype=torch.bfloat16, device="cuda:0"
+            self.batch_size,
+            self.max_seq_len,
+            self.kv_dim,
+            dtype=torch.bfloat16,
+            device="cuda:0",
         )
         self.pe_cache = torch.zeros(
-            self.batch_size, self.max_seq_len, self.k_pe_dim, dtype=torch.bfloat16, device="cuda:0"
+            self.batch_size,
+            self.max_seq_len,
+            self.k_pe_dim,
+            dtype=torch.bfloat16,
+            device="cuda:0",
         )
         self.k_cache = torch.zeros(
-            self.batch_size, self.max_seq_len, 128, dtype=torch.bfloat16, device="cuda:0"
+            self.batch_size,
+            self.max_seq_len,
+            128,
+            dtype=torch.bfloat16,
+            device="cuda:0",
         )
 
         self.placeholder = torch.zeros(1, 1, dtype=torch.int32, device="cpu")
@@ -149,10 +161,17 @@ class ShowHandsDSALayer(TileRTModule):
 
         qkv_dim = self.q_dim + self.kv_dim + self.k_pe_dim + 128
         x_rmsnorm_gamma_shape = (self.hidden_size,)
-        q_wb_shape = ((self.q_pe_lora_dim + self.q_nope_dim + 512) * self.num_heads, self.q_dim)
+        q_wb_shape = (
+            (self.q_pe_lora_dim + self.q_nope_dim + 512) * self.num_heads,
+            self.q_dim,
+        )
         wkv_b1_shape = (self.num_heads, self.q_pe_dim, self.v_head_dim)
         wkv_b2_shape = (self.num_heads, self.v_head_dim, self.kv_dim)
-        wkv_b2_scales_shape = (self.num_heads, self.v_head_dim // 128, self.kv_dim // 128)
+        wkv_b2_scales_shape = (
+            self.num_heads,
+            self.v_head_dim // 128,
+            self.kv_dim // 128,
+        )
         unproj_w_shape = (self.hidden_size, self.num_heads * self.v_head_dim)
 
         x_rmsnorm_gamma = torch.randn(x_rmsnorm_gamma_shape, dtype=torch.float32, device=device)
@@ -222,7 +241,11 @@ class ShowHandsDSALayer(TileRTModule):
             "dtype": torch.float16,
         }
 
-        exp_upgate_w_shape = (self.n_routed_experts + 1, self.exp_dims * 2, self.hidden_size)
+        exp_upgate_w_shape = (
+            self.n_routed_experts + 1,
+            self.exp_dims * 2,
+            self.hidden_size,
+        )
         exp_upgate_s_shape = (self.n_routed_experts + 1, self.exp_dims * 2 // 128, 64)
         exp_down_w_shape = (self.n_routed_experts + 1, self.hidden_size, self.exp_dims)
         exp_down_s_shape = (self.n_routed_experts + 1, 1024, self.exp_dims // 128)
@@ -289,7 +312,11 @@ class ShowHandsDSALayer(TileRTModule):
         q = torch.zeros(self.batch_size, self.seq_len, self.q_dim, **dev_attrs)
         kv = torch.zeros(self.batch_size, self.seq_len, self.kv_dim, **dev_attrs)
         q_pe = torch.zeros(
-            self.batch_size, self.seq_len, self.num_heads, self.q_pe_lora_dim, **dev_attrs
+            self.batch_size,
+            self.seq_len,
+            self.num_heads,
+            self.q_pe_lora_dim,
+            **dev_attrs,
         )
         ki = torch.zeros(self.batch_size, self.seq_len, 128, **dev_attrs)
         q_nope_down = torch.zeros(
@@ -302,7 +329,11 @@ class ShowHandsDSALayer(TileRTModule):
         iq_rt = torch.zeros(self.batch_size, self.seq_len, 64, 128, **dev_attrs)
         idx_score = torch.zeros(self.batch_size, self.seq_len, 64, **dev_attrs)
         idx_logits = torch.zeros(
-            self.batch_size, self.seq_len, self.max_seq_len, dtype=torch.float32, device=device
+            self.batch_size,
+            self.seq_len,
+            self.max_seq_len,
+            dtype=torch.float32,
+            device=device,
         )
         idx_sels = torch.zeros(self.batch_size, 2048, dtype=torch.int32, device=device)
         o = torch.zeros(self.batch_size, self.seq_len, self.num_heads, self.kv_dim, **dev_attrs)
@@ -323,11 +354,19 @@ class ShowHandsDSALayer(TileRTModule):
         )
         unproj_o = torch.zeros(self.batch_size, self.seq_len, self.hidden_size, **dev_attrs)
         scores = torch.zeros(
-            self.batch_size, self.seq_len, self.n_routed_experts, dtype=torch.float32, device=device
+            self.batch_size,
+            self.seq_len,
+            self.n_routed_experts,
+            dtype=torch.float32,
+            device=device,
         )
         x_mlp_in = torch.zeros(self.batch_size, self.seq_len, self.hidden_size, **dev_attrs)
         exp_up_gate = torch.zeros(
-            self.batch_size, self.seq_len, self.n_activate_experts + 1, self.exp_dims, **dev_attrs
+            self.batch_size,
+            self.seq_len,
+            self.n_activate_experts + 1,
+            self.exp_dims,
+            **dev_attrs,
         )
         sel_probs = torch.zeros(
             self.batch_size,
@@ -337,7 +376,11 @@ class ShowHandsDSALayer(TileRTModule):
             device=device,
         )
         sel_indices = torch.zeros(
-            self.batch_size, self.seq_len, self.n_activate_experts, dtype=torch.int32, device=device
+            self.batch_size,
+            self.seq_len,
+            self.n_activate_experts,
+            dtype=torch.int32,
+            device=device,
         )
         exp_out = torch.zeros(self.batch_size, self.seq_len, self.hidden_size, **dev_attrs)
         x_rmsnorm = torch.zeros(self.batch_size, self.seq_len, self.hidden_size, **dev_attrs)
@@ -517,7 +560,8 @@ class ShowHandsDSALayer(TileRTModule):
 
                 for weight_file in weight_files:
                     state_dict = load_file(
-                        os.path.join(self.model_path, weight_file), device=f"cuda:{device_id}"
+                        os.path.join(self.model_path, weight_file),
+                        device=f"cuda:{device_id}",
                     )
                     logger.info(f"Loaded weights from {weight_file} for device {device_id}")
                     state_dicts.update(state_dict)

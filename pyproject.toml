@@ -1,0 +1,203 @@
+[project]
+name = "tilert"
+dynamic = ["version"]
+
+description = "TileRT"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+]
+
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black==25.1.0",
+    "flake8==7.1.2",
+    "flake8-bugbear==24.12.12",
+    "flake8-comprehensions==3.16.0",
+    "flake8-docstrings==1.7.0",
+    "flake8-simplify==0.21.0",
+    "flake8-unused-arguments==0.0.13",
+    "flake8-variables-names==0.0.6",
+    "flake8-return==1.2.0",
+    "flake8-print==5.0.0",
+    "isort==6.0.1",
+    "mypy==1.15.0",
+    "bandit==1.8.3",
+    "pyupgrade==3.19.1",
+    "commitizen==4.4.1",
+    "codespell==2.4.1",
+    "pre-commit>=3.0.0",
+    "mdformat==0.7.17",
+    "mdformat-gfm==0.4.1",
+    "mdformat-frontmatter==2.0.8",
+    "mdformat-myst==0.2.1",
+    "mdformat-tables==1.0.0",
+    "mdformat-toc==0.3.0",
+    "mdformat-black==0.1.1",
+    "types-setuptools",
+    "types-requests",
+    "types-urllib3",
+    "types-six",
+    "tomli==2.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/tile-ai/TileRT"
+Issues = "https://github.com/tile-ai/TileRT/issues"
+
+[build-system]
+requires = [
+    "cmake>=3.25.0",  # required by c++ 20
+    "packaging",
+    "setuptools>=64.0.0",
+    "setuptools-scm>=8.0",
+    "wheel",
+    "pytest-runner",
+    "pytest",
+    "torch"
+]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+preview = true
+exclude = '''
+/(
+    \.git
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.venv
+  | _build
+  | build
+  | dist
+  | 3rd-party
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+skip_glob = ["3rd-party/**/*"]
+known_first_party = ["tilert"]
+
+[tool.mypy]
+python_version = "3.11"  # Base version for type checking
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_no_return = true
+warn_unreachable = true
+strict_optional = true
+ignore_missing_imports = true
+exclude = ["3rd-party/"]
+explicit_package_bases = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "3rd-party"]
+skips = ["B101", "B311", "B404", "B603", "B607"]
+ignore_nosec = false
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503", "E252"]
+exclude = [".git", "__pycache__", "build", "dist", "3rd-party"]
+docstring-convention = "google"
+ignore = [
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
+    "D203",
+    "D212",
+    "D213",
+    "D406",
+    "D407",
+    "D408",
+    "D409",
+    "D410",
+    "D411",
+    "D412",
+    "D413",
+    "D414",
+    "D415",
+    "D416",
+    "D417",
+    "D418",
+    "D419",
+    "T201",
+    "VNE001",
+]
+
+[tool.flake8.per-file-ignores]
+"__init__.py" = ["F401"]
+"tests/*" = ["D100", "D101", "D102", "D103"]
+"setup.py" = ["D100", "D101", "D102", "D103", "B009"]
+
+[tool.flake8.bugbear]
+extend-select = ["B"]
+ignore = ["B007"]  # Loop control variable not used within loop body
+
+[tool.flake8.comprehensions]
+extend-select = ["C4"]
+
+[tool.flake8.simplify]
+extend-select = ["SIM"]
+
+[tool.flake8.unused-arguments]
+extend-select = ["ARG"]
+
+[tool.flake8.variables-names]
+extend-select = ["N"]
+
+[tool.flake8.return]
+extend-select = ["RET"]
+
+[tool.flake8.print]
+extend-select = ["T"]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "v$version"
+bump_message = "bump: version $current_version → $new_version [skip ci]"
+update_changelog_on_bump = true
+major_version_zero = true
+
+[tool.pyupgrade]
+py311-plus = true
+args = ["--keep-percent-format", "--py311-plus"]
+
+[tool.codespell]
+skip = "3rd-party,*.git,*.pyc,build,dist,*.egg-info,.mypy_cache,.pytest_cache,"
+check-hidden = true
+ignore-words-list = "ThrID"
+
+[tool.mdformat]
+number = true
+wrap = "keep"
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+fallback_version = "0.1.0"
+tag_regex = "^(?P<prefix>v)?(?P<version>\\d+\\.\\d+\\.\\d+(?:-(?:alpha|beta|rc)\\.\\d+)?)$"

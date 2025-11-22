@@ -1,0 +1,107 @@
+minimum_pre_commit_version: 3.0.0
+
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    -   id: check-added-large-files
+        args: ['--maxkb=1024']
+    -   id: check-merge-conflict
+    -   id: check-symlinks
+    -   id: detect-private-key
+        files: (?!.*3rd-party)^.*$ # ignore 3rd-party files
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+    -   id: check-toml
+    -   id: check-ast
+    -   id: check-executables-have-shebangs
+    -   id: check-shebang-scripts-are-executable
+    -   id: debug-statements
+    -   id: mixed-line-ending
+        args: ['--fix=lf'] # fix line endings to unix style
+        files: (?!.*3rd-party)^.*$ # ignore 3rd-party files
+    -   id: check-case-conflict
+    -   id: check-json
+    -   id: trailing-whitespace
+
+-   repo: https://github.com/PyCQA/isort
+    rev: 6.0.1
+    hooks:
+    -   id: isort
+        files: \.py$
+        exclude: ^3rd-party/
+        args: ["--settings-path", "pyproject.toml"]
+
+-   repo: https://github.com/psf/black
+    rev: 25.1.0
+    hooks:
+    -   id: black
+        language_version: python3
+        stages: [pre-commit]
+
+-   repo: https://github.com/PyCQA/flake8
+    rev: 7.1.2
+    hooks:
+    -   id: flake8
+        additional_dependencies:
+            - flake8-bugbear==24.12.12
+            - flake8-comprehensions==3.16.0
+            - flake8-docstrings==1.7.0
+            - flake8-simplify==0.21.0
+            - flake8-unused-arguments==0.0.13
+            - flake8-variables-names==0.0.6
+            - flake8-return==1.2.0
+            - flake8-print==5.0.0
+
+-   repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.17
+    hooks:
+    -   id: mdformat
+        additional_dependencies:
+          - mdformat-gfm==0.4.1
+          - mdformat-frontmatter==2.0.8
+          - mdformat-myst==0.2.1
+          - mdformat-tables==1.0.0
+          - mdformat-toc==0.3.0
+          - mdformat-black==0.1.1
+
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.15.0
+    hooks:
+    -   id: mypy
+        files: \.py$
+        args: ["--config-file", "pyproject.toml"]
+        additional_dependencies:
+            - types-setuptools
+            - types-requests
+            - types-urllib3
+            - types-six
+
+-   repo: https://github.com/PyCQA/bandit
+    rev: 1.8.3
+    hooks:
+    -   id: bandit
+        args: ["-c", "pyproject.toml"]
+        additional_dependencies:
+            - bandit[toml]
+
+-   repo: https://github.com/asottile/pyupgrade
+    rev: v3.19.1
+    hooks:
+    -   id: pyupgrade
+        args: [--keep-percent-format, --py311-plus]
+
+-   repo: https://github.com/commitizen-tools/commitizen
+    rev: v4.4.1
+    hooks:
+    -   id: commitizen
+        stages: [commit-msg]
+    -   id: commitizen-branch
+        stages: [pre-push]
+
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+    -   id: codespell
+        args: ["--toml=pyproject.toml"]
+        additional_dependencies: [tomli]

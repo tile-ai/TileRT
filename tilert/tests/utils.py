@@ -39,7 +39,11 @@ def get_profile_log_tensor(
     num_sm = props.multi_processor_count
 
     return torch.zeros(
-        num_max_insts + 1 + SLICES_FOR_TILERT_OP, num_sm, 16, dtype=torch.uint64, device=device
+        num_max_insts + 1 + SLICES_FOR_TILERT_OP,
+        num_sm,
+        16,
+        dtype=torch.uint64,
+        device=device,
     )
 
 
