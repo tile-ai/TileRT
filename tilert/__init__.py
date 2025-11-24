@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import torch
+
 from .__version__ import __version__
 
 

@@ -133,7 +133,7 @@ export MODEL_WEIGHTS_DIR=/path/to/tilert_weights
 
 ### Running the Generation Example
 
-After downloading the weights, you can run the generation example inside the Docker environment as follows:
+After downloading the model weights, you can run the generation example within the Docker environment as follows:
 
 ```bash
 MODEL_WEIGHTS_DIR="/path/to/tilert_weights"
@@ -144,24 +144,36 @@ docker run --gpus all -it \
     tilert:v0.1.0
 ```
 
-Once inside the container, run the [generation script](https://github.com/tile-ai/TileRT/blob/main/tilert/generate.py):
+Once inside the container, you can run the following Python script:
 
-```bash
-python generate.py \
-    --model-weights-dir "${MODEL_WEIGHTS_DIR}" 2>&1 | tee generate.log
+```python
+import torch  # TileRT requires PyTorch runtime to be loaded first
+from tilert.generate import ShowHandsGenerator
+
+# Initialize the generator with desired settings
+generator = ShowHandsGenerator(
+    max_new_tokens=4000,
+    temperature=0.0,
+    model_weights_dir="xxx",  # Specify your model weights directory here
+)
+
+# Load pre-trained weights
+generator.from_pretrained()
+
+# Example prompt to test the model's generation abilities
+prompt = """Tell me three jokes:
+
+1. A dad joke,
+2. A programmer joke,
+3. A joke that only makes sense if you've ever tried to train a large language model.
+Keep each joke under 15 words.
+"""
+print("Prompt:", prompt)
+print("Completion:")
+completion = generator.generate(prompt)
 ```
 
-For instance, if you use the following prompt:
-
-```text
-Prompt: Tell me three jokes:
-1. a dad joke,
-2. a programmer joke,
-3. a joke that only makes sense if you've ever tried to train a large language model.
-Keep them all under 15 words.
-```
-
-TileRT might generate:
+For instance, using the above prompt, TileRT might generate:
 
 ```text
 1. I'm afraid for the calendar. Its days are numbered.
@@ -169,7 +181,9 @@ TileRT might generate:
 3. My model just generated a coherent sentence. I think I'll go lie down.
 ```
 
-This gives you a quick idea of the kind of outputs you can expect from the precompiled model.
+This example gives you a quick idea of the type of output you can expect from the precompiled model.
+
+For more details, please refer to the [generation script](https://github.com/tile-ai/TileRT/blob/main/tilert/generate.py).
 
 ## Status & Future Work
 
