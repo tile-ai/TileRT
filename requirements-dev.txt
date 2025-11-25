@@ -1,0 +1,63 @@
+-r requirements.txt
+einops
+
+# Build dependencies
+cmake>=3.25.0 # required by c++ 20
+packaging
+setuptools>=64.0.0
+wheel
+build>=1.0.0
+
+# Linting dependencies
+black==25.1.0
+isort==6.0.1
+flake8==7.1.2
+flake8-bugbear==24.12.12
+flake8-comprehensions==3.16.0
+flake8-docstrings==1.7.0
+flake8-simplify==0.21.0
+flake8-unused-arguments==0.0.13
+flake8-variables-names==0.0.6
+flake8-return==1.2.0
+flake8-print==5.0.0
+mypy==1.15.0
+tomli==2.2.1
+bandit==1.8.3
+pyupgrade==3.19.1
+clang-format==18.1.5
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+pynvml
+
+# Documentation
+mdformat==0.7.17
+mdformat-gfm==0.4.1
+mdformat-frontmatter==2.0.8
+mdformat-myst==0.2.1
+mdformat-tables==1.0.0
+mdformat-toc==0.3.0
+mdformat-black==0.1.1
+
+# Pre-commit
+pre-commit>=3.0.0
+
+# Commitizen
+commitizen==4.4.1
+
+# Codespell
+codespell==2.4.1
+
+# Type checking dependencies
+types-setuptools
+types-requests
+types-urllib3
+types-six
+
+scipy==1.16.2
+# Excel dependencies
+openpyxl==3.1.5
+
+### Version management / release tooling
+setuptools-scm[toml]
