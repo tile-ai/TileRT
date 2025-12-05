@@ -136,7 +136,7 @@ class ShowHandsGenerator:
             tokens[0, cur_pos_val] = next_token
             finished |= torch.logical_and(~prompt_mask[0, cur_pos_val], next_token == self.eos_id)
             prev_pos = cur_pos_val
-            if cur_pos_val > prompt_len:
+            if cur_pos_val >= prompt_len:
                 decoded_tokens = self.tokenizer.decode(
                     [next_token.item()], skip_special_tokens=True
                 )
