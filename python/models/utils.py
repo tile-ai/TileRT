@@ -6,6 +6,7 @@ __all__ = [
 ]
 
 import math
+from enum import IntEnum
 
 import torch
 
@@ -123,3 +124,35 @@ def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
     freqs_cis = freqs_cis.view(1, x_in.size(1), 1, x_in.size(-1))
     y_out = torch.view_as_real(x_in * freqs_cis).flatten(3)
     return y_out.to(dtype)
+
+
+class SwizzleMode(IntEnum):
+    """Swizzle mode."""
+
+    SWIZZLE_NONE = 0
+    SWIZZLE_32B = 32 // 16
+    SWIZZLE_64B = 64 // 16
+    SWIZZLE_128B = 128 // 16
+
+
+def gen_tensor_swizzle_map_1d(
+    rows: int, cols_in_16bytes: int, swizzle_mode: SwizzleMode = SwizzleMode.SWIZZLE_128B
+) -> torch.Tensor:
+    """
+    Generate flattened 1D swizzle map for given tensor dimensions.
+
+    Args:
+        rows (int): Number of rows in the tensor.
+        cols_in_16bytes (int): Number of columns in the tensor, in 16-byte units.
+        swizzle_mode (SwizzleMode): Swizzle mode to use. Default is SWIZZLE_128B.
+
+    Returns:
+        torch.Tensor: Flattened 1D swizzle map, in 16-byte units.
+    """
+    idxs = torch.arange(rows * cols_in_16bytes, dtype=torch.int32)
+    if swizzle_mode == SwizzleMode.SWIZZLE_NONE:
+        return idxs
+    row_ids = idxs // cols_in_16bytes
+    col_ids = idxs % cols_in_16bytes
+    col_ids = (row_ids % swizzle_mode) ^ col_ids
+    return row_ids * cols_in_16bytes + col_ids

@@ -10,7 +10,7 @@ import torch.nn as nn
 from tilert import logger
 from tilert.models.deepseek_config import get_rank, get_world_size
 from tilert.models.preprocess import WeightLoader
-from tilert.tests.utils import get_profile_log_tensor
+from tilert.utils import get_profile_log_tensor
 
 __all__ = [
     "TileRTModule",
@@ -31,6 +31,7 @@ class TileRTModule(nn.Module, ABC):
         golden_weights_dir: str = "",
         tilert_weights_dir: str = "",
         layer_idx: int = 0,
+        compute_kernel_type: str = "bf16",
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -41,13 +42,21 @@ class TileRTModule(nn.Module, ABC):
             golden_weights_dir: Optional path to golden weights directory.
             tilert_weights_path: Optional path to tilert weights directory.
             layer_idx: Layer index.
+            compute_kernel_type: Compute kernel type, bf16 by default; fp8 is also supported.
             *args: Additional positional arguments.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(*args, **kwargs)
 
         self.layer_idx = layer_idx
+
         self.flag_enable_tilert = False
+
+        if compute_kernel_type not in ["bf16", "fp8"]:
+            raise ValueError(
+                f"Invalid compute kernel type: {compute_kernel_type}, must be one of bf16, fp8."
+            )
+        self.compute_kernel_type = compute_kernel_type
 
         self.flag_enable_profiling_log = False
         self.flag_enable_external_profiling_log = False

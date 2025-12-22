@@ -12,11 +12,6 @@ __all__ = [
 ]
 
 
-# A hack: Add some extra bytes for storing instructions and glb bars.
-# Note that it should be no smaller than ((vm::DefaultConfig::kOpInstructionBytes +
-# vm::DefaultConfig::kMaxGlbBarsPerOp * sizeof(uint32_t)) *
-# vm::DefaultConfig::kMaxNumOps) = 64 * (128 + 8);
-# Here 1 slice is enough.
 SLICES_FOR_TILERT_OP = 1
 
 
@@ -39,11 +34,7 @@ def get_profile_log_tensor(
     num_sm = props.multi_processor_count
 
     return torch.zeros(
-        num_max_insts + 1 + SLICES_FOR_TILERT_OP,
-        num_sm,
-        16,
-        dtype=torch.uint64,
-        device=device,
+        num_max_insts + 1 + SLICES_FOR_TILERT_OP, num_sm, 16, dtype=torch.uint64, device=device
     )
 
 

@@ -2,6 +2,8 @@ from abc import abstractmethod
 
 import torch
 
+from tilert.models.utils import SwizzleMode, gen_tensor_swizzle_map_1d
+
 __all__ = [
     "IntermediateMapper",
     "BaseParams",
@@ -11,6 +13,8 @@ __all__ = [
     "TempVars",
     "DenseLayerParamsKeys",
     "MoELayerParamsKeys",
+    "CacheVars",
+    "gen_down_allreduce_fp8_params",
 ]
 
 
@@ -67,6 +71,80 @@ MoELayerParamsKeys = [
     "exp_down_weights",  # 21
     "exp_down_scales",  # 22
 ]
+
+
+def gen_down_allreduce_fp8_params(mat_in: torch.Tensor, mat_scale_in: torch.Tensor) -> torch.Tensor:
+    """Convert tilert mat and scale to tilert-fp8 input format."""
+    mat_and_scale_in = torch.zeros(
+        (9, 128, (56 * 256 + 64)), dtype=torch.float8_e4m3fn, device=mat_in.device
+    )
+    scale_part = mat_and_scale_in[..., 56 * 256 :]
+    mat_part = mat_and_scale_in[..., : 56 * 256].reshape(9, 128, 2, 56 * 8, 16)
+    mat_in = mat_in.reshape(9, 128, 56, 2, 8, 16)
+    mat_in = mat_in.transpose(2, 3).reshape(9, 128, 2, 56 * 8, 16)
+
+    swizzle_map = gen_tensor_swizzle_map_1d(56, 8, SwizzleMode.SWIZZLE_128B)
+    mat_part[:, :, :, swizzle_map] = mat_in
+
+    # copy mat_scale_in to scale_part
+    # scale to fp32
+    mat_scale_in_fp32 = mat_scale_in.to(torch.float32).reshape(9, 128, 16)  # 7x2 + 2 zeros
+    scale_part.copy_(mat_scale_in_fp32.view(dtype=torch.float8_e4m3fn))
+    return mat_and_scale_in
+
+
+def gen_expert_down_allreduce_fp8_params(
+    mat_in: torch.Tensor, mat_scale_in: torch.Tensor
+) -> torch.Tensor:
+    """Convert tilert mat and scale to tilert-fp8 input format."""
+    mat_and_scale_in = torch.zeros(
+        (257, 128, (56 * 256 + 64)), dtype=torch.float8_e4m3fn, device=mat_in.device
+    )
+    scale_part = mat_and_scale_in[..., 56 * 256 :]
+    mat_part = mat_and_scale_in[..., : 56 * 256].reshape(257, 128, 2, 56 * 8, 16)
+    mat_in = mat_in.reshape(257, 128, 56, 2, 8, 16)
+    mat_in = mat_in.transpose(2, 3).reshape(257, 128, 2, 56 * 8, 16)
+
+    swizzle_map = gen_tensor_swizzle_map_1d(56, 8, SwizzleMode.SWIZZLE_128B)
+    mat_part[:, :, :, swizzle_map] = mat_in
+
+    # copy mat_scale_in to scale_part
+    # scale to fp32
+    mat_scale_in_fp32 = mat_scale_in.to(torch.float32).reshape(257, 128, 16)  # 7x2 + 2 zeros
+    scale_part.copy_(mat_scale_in_fp32.view(dtype=torch.float8_e4m3fn))
+    return mat_and_scale_in
+
+
+def gen_unproj_o_allreduce_fp8_params(
+    mat_in: torch.Tensor, mat_scale_in: torch.Tensor
+) -> torch.Tensor:
+    """Convert tilert mat and scale to tilert-fp8 input format."""
+    mat_and_scale_in = torch.zeros(
+        (128, 4, (56 * 512 + 8 * 4 * 4)), dtype=torch.float8_e4m3fn, device=mat_in.device
+    )
+    scale_part = mat_and_scale_in[..., 56 * 512 :].reshape(128, 4, 128)
+    mat_part = mat_and_scale_in[..., : 56 * 512].reshape(128, 4, 4, 56 * 8, 16)
+
+    mat_in = mat_in.reshape(128, 56, 4, 512)
+    mat_in = (
+        mat_in.transpose(1, 2)
+        .reshape(128, 4, 56, 4, 128)
+        .transpose(2, 3)
+        .reshape(128, 4, 4, 56 * 8, 16)
+    )
+
+    swizzle_map = gen_tensor_swizzle_map_1d(56, 8, SwizzleMode.SWIZZLE_128B)
+    mat_part[:, :, :, swizzle_map] = mat_in
+    # 896x16
+    mat_scale_in_fp32 = mat_scale_in.to(torch.float32).reshape(128, 7, 16)
+    # padding to 1024x16
+    zeros = torch.zeros((128, 1, 16), dtype=torch.float32, device=mat_scale_in.device)
+    mat_scale_in_fp32 = torch.cat([mat_scale_in_fp32, zeros], dim=1).contiguous()
+    # transpose
+    mat_scale_in_fp32 = mat_scale_in_fp32.reshape(128, 8, 4, 4).transpose(1, 2).contiguous()
+    scale_part.copy_(mat_scale_in_fp32.view(dtype=torch.float8_e4m3fn).reshape(128, 4, 128))
+
+    return mat_and_scale_in.contiguous()
 
 
 class IntermediateMapper:
@@ -160,6 +238,30 @@ class MlaParams(BaseParams):
     def num_params() -> int:
         return 16
 
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_x_rmsnorm_gamma_dev_{device_id}": self.x_rmsnorm_gamma.to(device_id),
+            f"layer_{layer_id}_qkv_wa_weights_dev_{device_id}": self.qkv_wa_weights.to(device_id),
+            f"layer_{layer_id}_qkv_wa_scales_dev_{device_id}": self.qkv_wa_scales.to(device_id),
+            f"layer_{layer_id}_k_weights_dev_{device_id}": self.k_weights.to(device_id),
+            f"layer_{layer_id}_k_bias_dev_{device_id}": self.k_bias.to(device_id),
+            f"layer_{layer_id}_q_rmsnorm_gamma_dev_{device_id}": self.q_rmsnorm_gamma.to(device_id),
+            f"layer_{layer_id}_q_wb_weights_dev_{device_id}": self.q_wb_weights.to(device_id),
+            f"layer_{layer_id}_q_wb_scales_dev_{device_id}": self.q_wb_scales.to(device_id),
+            f"layer_{layer_id}_id_score_weights_dev_{device_id}": self.id_score_weights.to(
+                device_id
+            ),
+            f"layer_{layer_id}_wkv_b1_weights_dev_{device_id}": self.wkv_b1_weights.to(device_id),
+            f"layer_{layer_id}_wkv_b1_scales_dev_{device_id}": self.wkv_b1_scales.to(device_id),
+            f"layer_{layer_id}_kv_rmsnorm_gamma_dev_{device_id}": self.kv_rmsnorm_gamma.to(
+                device_id
+            ),
+            f"layer_{layer_id}_wkv_b2_weights_dev_{device_id}": self.wkv_b2_weights.to(device_id),
+            f"layer_{layer_id}_wkv_b2_scales_dev_{device_id}": self.wkv_b2_scales.to(device_id),
+            f"layer_{layer_id}_unproj_weights_dev_{device_id}": self.unproj_weights.to(device_id),
+            f"layer_{layer_id}_unproj_scales_dev_{device_id}": self.unproj_scales.to(device_id),
+        }
+
 
 class MLPParams(BaseParams):
     def __init__(
@@ -180,6 +282,15 @@ class MLPParams(BaseParams):
     @staticmethod
     def num_params() -> int:
         return 5
+
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_unproj_o_gamma_dev_{device_id}": self.unproj_o_gamma.to(device_id),
+            f"layer_{layer_id}_upgate_weights_dev_{device_id}": self.upgate_weights.to(device_id),
+            f"layer_{layer_id}_upgate_scales_dev_{device_id}": self.upgate_scales.to(device_id),
+            f"layer_{layer_id}_down_weights_dev_{device_id}": self.down_weights.to(device_id),
+            f"layer_{layer_id}_down_scales_dev_{device_id}": self.down_scales.to(device_id),
+        }
 
 
 class MoEParams(BaseParams):
@@ -205,6 +316,68 @@ class MoEParams(BaseParams):
     @staticmethod
     def num_params() -> int:
         return 7
+
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_unproj_o_gamma_dev_{device_id}": self.unproj_o_gamma.to(device_id),
+            f"layer_{layer_id}_exp_proj_weights_dev_{device_id}": self.exp_proj_weights.to(
+                device_id
+            ),
+            f"layer_{layer_id}_exp_bias_dev_{device_id}": self.exp_bias.to(device_id),
+            f"layer_{layer_id}_exp_upgate_weights_dev_{device_id}": self.exp_upgate_weights.to(
+                device_id
+            ),
+            f"layer_{layer_id}_exp_upgate_scales_dev_{device_id}": self.exp_upgate_scales.to(
+                device_id
+            ),
+            f"layer_{layer_id}_exp_down_weights_dev_{device_id}": self.exp_down_weights.to(
+                device_id
+            ),
+            f"layer_{layer_id}_exp_down_scales_dev_{device_id}": self.exp_down_scales.to(device_id),
+        }
+
+
+class MlaFp8Params(BaseParams):
+    def __init__(
+        self,
+        unproj_o_weights_and_scales: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.unproj_o_weights_and_scales = self.register_params(unproj_o_weights_and_scales)
+
+    @staticmethod
+    def num_params() -> int:
+        return 1
+
+
+class MLPFp8Params(BaseParams):
+    def __init__(
+        self,
+        upgate_weights_and_scales: torch.Tensor,
+        down_weights_and_scales: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.upgate_weights_and_scales = self.register_params(upgate_weights_and_scales)
+        self.down_weights_and_scales = self.register_params(down_weights_and_scales)
+
+    @staticmethod
+    def num_params() -> int:
+        return 2
+
+
+class MoEFp8Params(BaseParams):
+    def __init__(
+        self,
+        exp_upgate_weights_and_scales: torch.Tensor,
+        exp_down_weights_and_scales: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self.exp_upgate_weights_and_scales = self.register_params(exp_upgate_weights_and_scales)
+        self.exp_down_weights_and_scales = self.register_params(exp_down_weights_and_scales)
+
+    @staticmethod
+    def num_params() -> int:
+        return 2
 
 
 class TempVars(BaseParams):
@@ -269,6 +442,28 @@ class TempVars(BaseParams):
     def num_params() -> int:
         return 26
 
+    def tot_size_in_bytes_aligned(self, aligned_size: int) -> int:
+        tot_size: int = 0
+        for param in self._params:
+            aligned_param_size = (param.nbytes + aligned_size - 1) // aligned_size * aligned_size
+            tot_size += aligned_param_size
+        return tot_size
+
+    def generate_params_with_continuous_storage(
+        self, device: torch.device, aligned_size: int = 1024
+    ) -> list[torch.Tensor]:
+        tot_size = self.tot_size_in_bytes_aligned(aligned_size)
+        cloned_params = []
+        large_tensor = torch.zeros(tot_size, device=device, dtype=torch.uint8)
+        offset = 0
+        for param in self._params:
+            aligned_param_size = (param.nbytes + aligned_size - 1) // aligned_size * aligned_size
+            cloned_params.append(
+                large_tensor[offset : offset + param.nbytes].view(param.dtype).view(param.shape)
+            )
+            offset += aligned_param_size
+        return cloned_params
+
 
 class CacheVars(BaseParams):
     def __init__(
@@ -302,3 +497,13 @@ class LLMHeadParams(BaseParams):
     @staticmethod
     def num_params() -> int:
         return 2
+
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_model.norm.weight_dev_{device_id}": self.hidden_rms_gamma.to(
+                device_id
+            ),
+            f"layer_{layer_id}_lm_head.weight_dev_{device_id}": self.head_proj_weights.to(
+                device_id
+            ),
+        }

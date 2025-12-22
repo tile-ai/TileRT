@@ -7,6 +7,9 @@ from typing import Any
 
 import torch
 
+if not hasattr(torch, "ops"):
+    raise RuntimeError("PyTorch is required but torch.ops is not available")
+
 from .__version__ import __version__
 
 
@@ -44,7 +47,9 @@ def _load_library(filename: str) -> Any:
 
 _load_library("libtilert.so")
 
+
 from . import models  # noqa: E402
+from .generate import ShowHandsGenerator  # noqa: E402
 from .models import deepseek_v3_2  # noqa: E402
 from .tilert_init import tilert_init  # noqa: E402
 
@@ -53,5 +58,6 @@ __all__ = [
     "tilert_init",
     "models",
     "deepseek_v3_2",
+    "ShowHandsGenerator",
     "__version__",
 ]
