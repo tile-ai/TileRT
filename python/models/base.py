@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from tilert import logger
 from tilert.models.deepseek_config import get_rank, get_world_size
+from tilert.models.deepseek_v3_2.params import BaseParams
 from tilert.models.preprocess import WeightLoader
 from tilert.utils import get_profile_log_tensor
 
@@ -52,9 +53,10 @@ class TileRTModule(nn.Module, ABC):
 
         self.flag_enable_tilert = False
 
-        if compute_kernel_type not in ["bf16", "fp8"]:
+        if compute_kernel_type not in ["bf16", "fp8", "fp8mma"]:
             raise ValueError(
-                f"Invalid compute kernel type: {compute_kernel_type}, must be one of bf16, fp8."
+                f"Invalid compute kernel type: {compute_kernel_type}, \
+                must be one of bf16, fp8, fp8mma."
             )
         self.compute_kernel_type = compute_kernel_type
 
@@ -215,7 +217,7 @@ class TileRTModule(nn.Module, ABC):
         raise NotImplementedError("Tilert forward not implemented")
 
     @abstractmethod
-    def to_tilert_weights(self, *args: Any, **kwargs: Any) -> None:
+    def to_tilert_weights(self, *args: Any, **kwargs: Any) -> BaseParams | None:
         """Convert weights to tilert.
 
         Args:

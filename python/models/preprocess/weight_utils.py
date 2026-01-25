@@ -11,9 +11,10 @@ from tilert.models.deepseek_config import get_world_size
 __all__ = [
     "print_weights_info",
     "WeightLoader",
+    "DownAllreduceWeightsConverter",
+    "RMSNormProjQAKVAKIWeightsConverter",
     "RMSNormHeadProjWeightsConverter",
     "ExpertSelectUpGateSiLUWeightsConverter",
-    "RMSNormProjQAKVAKIRopeWeightsConverter",
     "RMSNormUpGateSiLUWeightsConverter",
 ]
 
@@ -233,107 +234,7 @@ class WeightLoader:
         return weight_dict[name]["data"]
 
 
-class ExpertSelectUpGateSiLUWeightsConverter:
-    """Weights converter class."""
-
-    @staticmethod
-    def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
-        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
-        # PTX isa fig.88
-        pre_shape = mat_in.shape[:-2]
-        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
-        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
-
-    @staticmethod
-    def tilert_to_tilert_144sm(
-        mat_in: torch.Tensor, mat_scale_in: torch.Tensor, swizzle_for_mma_16x32: bool = False
-    ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-        Returns:
-            tilert_144sm weights and scales
-        """
-        exp_num = mat_in.shape[0]
-        assert mat_in.shape == (exp_num, 512, 7168)
-        assert mat_scale_in.shape == (exp_num, 4, 64)
-        weights_trt = mat_in.reshape(exp_num, 128, 4, 7168)
-        weights_w1 = weights_trt[:, :, :2].reshape(exp_num, 256, 7168)
-        weights_w3 = weights_trt[:, :, 2:].reshape(exp_num, 256, 7168)
-        # to 16x1024 blocks
-        weights_w1 = weights_w1.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
-        weights_w3 = weights_w3.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
-        if swizzle_for_mma_16x32:
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
-            weights_w1 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w1)
-            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 1024)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
-            weights_w3 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w3)
-            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 1024)
-
-        weights = torch.cat([weights_w1, weights_w3], dim=3)
-        assert weights.shape == (exp_num, 16, 7, 32, 1024)
-        weights = weights.reshape(exp_num, 16, 7, 32 * 1024)
-
-        # For scales, first unswizzle
-        scales_unswizzled = torch.zeros(exp_num, 4, 56)
-        for i in range(64):
-            if ((i % 8) * 8 + i // 8) < 56:
-                scales_unswizzled[..., ((i % 8) * 8 + i // 8)] = mat_scale_in[..., i]
-        scales_unswizzled = scales_unswizzled.reshape(exp_num, 2, 2, 56)
-
-        scales_w1 = scales_unswizzled[:, :, :1].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
-        scales_w1 = scales_w1.transpose(2, 3)
-        scales_w3 = scales_unswizzled[:, :, 1:].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
-        scales_w3 = scales_w3.transpose(2, 3)
-        scales = torch.cat([scales_w1, scales_w3], dim=3)
-        assert scales.shape == (exp_num, 16, 7, 2, 8)
-        scales = (
-            scales.reshape(exp_num, 16, 7, 2 * 8).to(torch.bfloat16).view(dtype=torch.float8_e4m3fn)
-        )
-        weights_and_scales = torch.zeros(
-            exp_num, 16, 7, 32 * 1024 + 128, dtype=torch.float8_e4m3fn, device=mat_in.device
-        )
-        weights_and_scales[:, :, :, : 32 * 1024].copy_(weights)
-        weights_and_scales[:, :, :, 32 * 1024 : 32 * 1024 + 32].copy_(scales)
-        return weights_and_scales
-
-    @staticmethod
-    def tilert_to_tilert_144sm_mma(
-        mat_in: torch.Tensor,
-        mat_scale_in: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm_mma input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-        Returns:
-            tilert_144sm weights and scales
-        """
-        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
-            mat_in, mat_scale_in, True
-        )
-
-
-class RMSNormHeadProjWeightsConverter:
-    """Weights converter class."""
-
-    @staticmethod
-    def tilert_to_tilert_native_bf16_warp_gemv(
-        tilert_weight_in: torch.Tensor,
-    ) -> torch.Tensor:
-        """Convert TILERT weights to TILERT native bf16 warp gemv weights."""
-        weights = tilert_weight_in.reshape(1010, 16, 7, 1024)
-        weights = weights.transpose(1, 2).reshape(7070, 16, 1024)
-        return weights.contiguous()
-
-
-class RMSNormProjQAKVAKIRopeWeightsConverter:
+class RMSNormProjQAKVAKIWeightsConverter:
     """Weights converter class."""
 
     @staticmethod
@@ -386,143 +287,6 @@ class RMSNormProjQAKVAKIRopeWeightsConverter:
         return wq_a, wq_a_scale, wkv_a, wkv_a_scale, wk, wk_scale, attn_norm_weight
 
     @staticmethod
-    def common_to_tilert(
-        wq_a: torch.Tensor,
-        wq_a_scale: torch.Tensor,
-        wkv_a: torch.Tensor,
-        wkv_a_scale: torch.Tensor,
-        wk: torch.Tensor,
-        wk_scale: torch.Tensor,
-        attn_norm_weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Convert common weights to tilert weights.
-
-        Args:
-            wq_a: Common weight tensor.
-            wq_a_scale: Common weight scale tensor.
-            wkv_a: Common weight tensor.
-            wkv_a_scale: Common weight scale tensor.
-            wk: Common weight tensor.
-            wk_scale: Common weight scale tensor.
-            attn_norm_weight: Common attention norm weight tensor.
-        Returns:
-            tuple: Tilert weights.
-        """
-        wqkv_a = torch.cat([wq_a, wkv_a, wk], dim=0)
-        wqkv_a_scales_raw = torch.cat([wq_a_scale, wkv_a_scale, wk_scale], dim=0)
-
-        wqkv_a_scales = torch.zeros((18, 64), dtype=torch.bfloat16, device=wq_a_scale.device)
-        for i in range(64):
-            wqkv_a_scales[:, i] = wqkv_a_scales_raw[:, ((i % 8) * 8 + i // 8) % 56]
-            if ((i % 8) * 8 + i // 8) >= 56:
-                wqkv_a_scales[:, i] = 0.0
-        wqkv_a_scales_0 = wqkv_a_scales[:16, :]
-        wqkv_a_scales_1 = wqkv_a_scales[16:17, :]
-        wqkv_a_scales_2 = wqkv_a_scales[17:, :]
-
-        wqkv_a_scales_0 = wqkv_a_scales_0.reshape((16, 1, 64)).repeat(1, 8, 1).reshape(-1, 64)
-        wqkv_a_scales = torch.cat([wqkv_a_scales_0, wqkv_a_scales_1, wqkv_a_scales_2], dim=0)
-        assert wqkv_a_scales.shape == (130, 64)
-        return wqkv_a.contiguous(), wqkv_a_scales.contiguous(), attn_norm_weight.clone()
-
-    @staticmethod
-    def common_to_tilert_fp8(
-        wq_a: torch.Tensor,
-        wq_a_scale: torch.Tensor,
-        wkv_a: torch.Tensor,
-        wkv_a_scale: torch.Tensor,
-        wk: torch.Tensor,
-        wk_scale: torch.Tensor,
-        attn_norm_weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert common weights to tilert weights.
-
-        Args:
-            wq_a: Common weight tensor.
-            wq_a_scale: Common weight scale tensor.
-            wkv_a: Common weight tensor.
-            wkv_a_scale: Common weight scale tensor.
-            wk: Common weight tensor.
-            wk_scale: Common weight scale tensor.
-            attn_norm_weight: Common attention norm weight tensor.
-        Returns:
-            tuple: Tilert fp8 weights.
-        """
-        wq_a_raw: torch.Tensor = wq_a.detach().clone()
-        wkv_a_raw: torch.Tensor = wkv_a.detach().clone()
-        wq_a_raw = torch.cat([wq_a_raw, wkv_a_raw[:512], wk, wkv_a_raw[512:]], dim=0)
-
-        wq_a_raw = wq_a_raw.reshape(35, 64, 14, 512)
-        wq_a_raw = wq_a_raw.permute(0, 2, 1, 3)
-
-        wq_a_raw = wq_a_raw.reshape(35, 14, 16, 4, 4, 128)
-        wq_a_copy = wq_a_raw.contiguous().clone()
-        wq_a_raw[:, :, 1::2, :, :, :64] = wq_a_copy[:, :, 1::2, :, :, 64:]
-        wq_a_raw[:, :, 1::2, :, :, 64:] = wq_a_copy[:, :, 1::2, :, :, :64]
-        wq_a_raw = wq_a_raw.reshape(35, 14, 16, 4, 4, 2, 64)
-        wq_a_copy = wq_a_raw.contiguous().clone()
-        wq_a_raw[:, :, :, 2:, :, :, :32] = wq_a_copy[:, :, :, 2:, :, :, 32:]
-        wq_a_raw[:, :, :, 2:, :, :, 32:] = wq_a_copy[:, :, :, 2:, :, :, :32]
-        wq_a_raw = wq_a_raw.reshape(35, 14, 16, 4, 4, 2, 2, 32)
-        wq_a_copy = wq_a_raw.contiguous().clone()
-        wq_a_raw[:, :, :, 1::2, :, :, :, :16] = wq_a_copy[:, :, :, 1::2, :, :, :, 16:]
-        wq_a_raw[:, :, :, 1::2, :, :, :, 16:] = wq_a_copy[:, :, :, 1::2, :, :, :, :16]
-
-        wq_a_raw = wq_a_raw.reshape(35, 14, 16, 4, 4, 128)
-        wq_a_raw = wq_a_raw.permute(0, 1, 4, 2, 3, 5).reshape(35, 14, -1).contiguous()
-        wq_a_raw = wq_a_raw.reshape(35, 14, -1).contiguous()
-
-        wq_s_raw: torch.Tensor = wq_a_scale.detach().clone()
-        wkv_s_raw: torch.Tensor = wkv_a_scale.detach().clone()
-        wq_s_raw = torch.cat([wq_s_raw, wkv_s_raw[:4], wk_scale, wkv_s_raw[4:]], dim=0)
-        wq_s_raw = wq_s_raw.reshape(18, 1, 14, 4).repeat(1, 2, 1, 1).reshape(36, 1, 14, 4)
-        wq_s_raw = wq_s_raw[:35].reshape(35, 14, -1).contiguous()
-        wq_s_raw = wq_s_raw.view(torch.float8_e4m3fn)
-        wq_as_raw = torch.cat([wq_a_raw, wq_s_raw], dim=-1)
-
-        return wq_as_raw.contiguous(), attn_norm_weight.clone()
-
-    @staticmethod
-    def common_to_tilert_native_bf16(
-        wq_a: torch.Tensor,
-        wq_a_scale: torch.Tensor,
-        wkv_a: torch.Tensor,
-        wkv_a_scale: torch.Tensor,
-        wk: torch.Tensor,
-        wk_scale: torch.Tensor,
-        attn_norm_weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert common weights to weights for tilert native bf16 op.
-
-        Args:
-            wq_a: Common weight tensor.
-            wq_a_scale: Common weight scale tensor.
-            wkv_a: Common weight tensor.
-            wkv_a_scale: Common weight scale tensor.
-            wk: Common weight tensor.
-            wk_scale: Common weight scale tensor.
-            attn_norm_weight: Common attention norm weight tensor.
-        Returns:
-            tuple: Tilert weights for native bf16 op.
-        """
-        wq_a_scale = wq_a_scale.reshape((12, 56, 1)).repeat(1, 1, 128).reshape((12, 1, 7168))
-        wq_a_scale = wq_a_scale.repeat(1, 128, 1).reshape((1536, 7168))
-        wkv_a_scale = wkv_a_scale.reshape((5, 56, 1)).repeat(1, 1, 128).reshape((5, 1, 7168))
-        wkv_a_scale = wkv_a_scale.repeat(1, 128, 1).reshape((-1, 7168))
-        wkv_a_scale = wkv_a_scale[:576]
-        wk_scale = wk_scale.reshape((1, 56, 1)).repeat(1, 1, 128).reshape((1, 1, 7168))
-        wk_scale = wk_scale.repeat(1, 128, 1).reshape((128, 7168))
-        wq_a = wq_a.reshape((1536, 7168)).float() * wq_a_scale.float()
-        wkv_a = wkv_a.reshape((576, 7168)).float() * wkv_a_scale.float()
-        wk = wk.reshape((128, 7168)).float() * wk_scale.float()
-        weights = torch.cat([wq_a, wkv_a, wk], dim=0)
-        assert weights.shape == (1536 + 576 + 128, 7168)
-        return weights.to(torch.bfloat16).contiguous(), attn_norm_weight.clone()
-
-    @staticmethod
     def common_to_tilert_native_bf16_warp_gemv(
         wq_a: torch.Tensor,
         wq_a_scale: torch.Tensor,
@@ -564,58 +328,131 @@ class RMSNormProjQAKVAKIRopeWeightsConverter:
         weights = weights.transpose(1, 2)  # 140, 7, 16, 1024
         return weights.to(torch.bfloat16).contiguous(), attn_norm_weight.clone()
 
+
+class ExpertSelectUpGateSiLUWeightsConverter:
+    """Weights converter class."""
+
     @staticmethod
-    def common_to_tilert_dequant_bf16(
-        wq_a: torch.Tensor,
-        wq_a_scale: torch.Tensor,
-        wkv_a: torch.Tensor,
-        wkv_a_scale: torch.Tensor,
-        wk: torch.Tensor,
-        wk_scale: torch.Tensor,
-        attn_norm_weight: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
+        # PTX isa fig.88
+        pre_shape = mat_in.shape[:-2]
+        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
+        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
+
+    @staticmethod
+    def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
+        # PTX isa fig.88
+        pre_shape = mat_in.shape[:-2]
+        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
+        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 2).transpose(-3, -2)
+
+    @staticmethod
+    def tilert_to_tilert_144sm(
+        mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str | None = None
+    ) -> torch.Tensor:
         """
-        Convert common weights to weights for tilert dequant bf16 op.
+        Convert tilert weights and scales to tilert_144sm input format.
 
         Args:
-            wq_a: Common weight tensor.
-            wq_a_scale: Common weight scale tensor.
-            wkv_a: Common weight tensor.
-            wkv_a_scale: Common weight scale tensor.
-            wk: Common weight tensor.
-            wk_scale: Common weight scale tensor.
-            attn_norm_weight: Common attention norm weight tensor.
+            mat_in: tilert weights
+            mat_scale_in: tilert scales
+            mma_type: MMA type, None,"16x32" or "16x16"
         Returns:
-            tuple: Tilert weights for dequant bf16 op.
+            tilert_144sm weights and scales
         """
-        wq_a = wq_a.reshape((384, 4, 7168))
-        wkv_a = wkv_a.reshape((144, 4, 7168))
-        wk = wk.reshape((32, 4, 7168))
-        wqkv = torch.cat([wq_a, wkv_a, wk], dim=0).reshape(140, 4, 4 * 7168)
+        exp_num = mat_in.shape[0]
+        assert mat_in.shape == (exp_num, 512, 7168)
+        assert mat_scale_in.shape == (exp_num, 4, 64)
+        weights_trt = mat_in.reshape(exp_num, 128, 4, 7168)
+        weights_w1 = weights_trt[:, :, :2].reshape(exp_num, 256, 7168)
+        weights_w3 = weights_trt[:, :, 2:].reshape(exp_num, 256, 7168)
+        # to 16x1024 blocks
+        weights_w1 = weights_w1.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
+        weights_w3 = weights_w3.reshape(exp_num, 16, 16, 7, 1024).transpose(2, 3)
+        if mma_type == "16x32":
+            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
+            weights_w1 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w1)
+            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 1024)
+            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 32, 32).transpose(3, 4)
+            weights_w3 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_w3)
+            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 1024)
+        elif mma_type == "16x16":
+            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 64, 16).transpose(3, 4)
+            weights_w1 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16(weights_w1)
+            weights_w1 = weights_w1.reshape(exp_num, 16, 7, 16, 1024)
+            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 64, 16).transpose(3, 4)
+            weights_w3 = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x16(weights_w3)
+            weights_w3 = weights_w3.reshape(exp_num, 16, 7, 16, 1024)
 
-        wq_a_scale = wq_a_scale.reshape((12, 1, 56)).repeat(1, 32, 1).reshape((384, 1, 56))
-        wkv_a_scale = wkv_a_scale.reshape((5, 1, 56)).repeat(1, 32, 1).reshape((160, 1, 56))[:144]
-        wk_scale = wk_scale.reshape((1, 1, 56)).repeat(1, 32, 1).reshape((32, 1, 56))
-        wqkv_scales = torch.cat([wq_a_scale, wkv_a_scale, wk_scale], dim=0).reshape(140, 4, 56)
-        wqkv_scales_swizzled = torch.zeros(140, 4, 64, dtype=torch.bfloat16, device=wq_a.device)
-        # swizzle
+        weights = torch.cat([weights_w1, weights_w3], dim=3)
+        assert weights.shape == (exp_num, 16, 7, 32, 1024)
+        weights = weights.reshape(exp_num, 16, 7, 32 * 1024)
+
+        # For scales, first unswizzle
+        scales_unswizzled = torch.zeros(exp_num, 4, 56)
         for i in range(64):
-            wqkv_scales_swizzled[..., i] = wqkv_scales[..., ((i % 8) * 8 + i // 8) % 56]
-        weights = torch.zeros(
-            140, 4, 4 * 7168 + 64 * 2, dtype=torch.float8_e4m3fn, device=wq_a.device
+            if ((i % 8) * 8 + i // 8) < 56:
+                scales_unswizzled[..., ((i % 8) * 8 + i // 8)] = mat_scale_in[..., i]
+        scales_unswizzled = scales_unswizzled.reshape(exp_num, 2, 2, 56)
+
+        scales_w1 = scales_unswizzled[:, :, :1].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
+        scales_w1 = scales_w1.transpose(2, 3)
+        scales_w3 = scales_unswizzled[:, :, 1:].repeat(1, 1, 8, 1).reshape(exp_num, 16, 1, 7, 8)
+        scales_w3 = scales_w3.transpose(2, 3)
+        scales = torch.cat([scales_w1, scales_w3], dim=3)
+        assert scales.shape == (exp_num, 16, 7, 2, 8)
+        scales = (
+            scales.reshape(exp_num, 16, 7, 2 * 8).to(torch.bfloat16).view(dtype=torch.float8_e4m3fn)
         )
-        weights_part = weights[:, :, : 4 * 7168]
-        scales_part = weights[:, :, 4 * 7168 :]
-        weights_part.copy_(wqkv)
-        scales_part.copy_(wqkv_scales_swizzled.view(dtype=torch.float8_e4m3fn))
-        return weights.contiguous(), attn_norm_weight.clone()
+        weights_and_scales = torch.zeros(
+            exp_num, 16, 7, 32 * 1024 + 128, dtype=torch.float8_e4m3fn, device=mat_in.device
+        )
+        weights_and_scales[:, :, :, : 32 * 1024].copy_(weights)
+        weights_and_scales[:, :, :, 32 * 1024 : 32 * 1024 + 32].copy_(scales)
+        return weights_and_scales
+
+    @staticmethod
+    def tilert_to_tilert_144sm_mma(
+        mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str = "16x32"
+    ) -> torch.Tensor:
+        """
+        Convert tilert weights and scales to tilert_144sm_mma input format.
+
+        Args:
+            mat_in: tilert weights
+            mat_scale_in: tilert scales
+        Returns:
+            tilert_144sm weights and scales
+        """
+        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
+            mat_in, mat_scale_in, mma_type
+        )
+
+
+class RMSNormHeadProjWeightsConverter:
+    """Weights converter class."""
+
+    @staticmethod
+    def tilert_to_tilert_native_bf16_warp_gemv(
+        tilert_weight_in: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert TILERT weights to TILERT native bf16 warp gemv weights."""
+        weights = tilert_weight_in.reshape(1010, 16, 7, 1024)
+        weights = weights.transpose(1, 2).reshape(7070, 16, 1024)
+        return weights.contiguous()
 
 
 class RMSNormUpGateSiLUWeightsConverter:
     """Weights converter class."""
 
     @staticmethod
-    def tilert_to_tilert_144sm(mat_in: torch.Tensor, mat_scale_in: torch.Tensor) -> torch.Tensor:
+    def tilert_to_tilert_144sm(
+        mat_in: torch.Tensor,
+        mat_scale_in: torch.Tensor,
+        mma_type: str | None = None,
+    ) -> torch.Tensor:
         """
         Convert tilert weights and scales to tilert_144sm input format.
 
@@ -625,4 +462,107 @@ class RMSNormUpGateSiLUWeightsConverter:
         Returns:
             tilert_144sm weights and scales
         """
-        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(mat_in, mat_scale_in)
+        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
+            mat_in, mat_scale_in, mma_type
+        )
+
+    @staticmethod
+    def tilert_to_tilert_144sm_mma(
+        mat_in: torch.Tensor,
+        mat_scale_in: torch.Tensor,
+        mma_type: str = "16x32",
+    ) -> torch.Tensor:
+        """Convert tilert weights and scales to tilert_144sm_mma input format."""
+        return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm_mma(
+            mat_in, mat_scale_in, mma_type
+        )
+
+
+class UnProjOAllreduceWeightsConverter:
+    """Weights converter class."""
+
+    @staticmethod
+    def tilert_to_tilert_112sm_mma(
+        mat_in: torch.Tensor,
+        mat_scale_in: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert tilert weights to tilert_112sm_mma input format.
+
+        Args:
+            mat_in: tilert weights, [7168, 2048]
+            mat_scale_in: tilert scales, [896, 16]
+        Returns:
+            tilert_112sm weights, scales
+        """
+        swizzle_for_mma_16x32 = True
+        assert mat_in.shape == (7168, 2048)
+        assert mat_scale_in.shape == (896, 16)
+        weights_trt = mat_in.reshape(112, 64, 2048)
+        # to 64*512 blocks
+        weights_trt = weights_trt.reshape(112, 64, 4, 512).transpose(1, 2)  # (112, 4, 64, 512)
+        if swizzle_for_mma_16x32:
+            # to (112, 4, 4(n), 16(k), 16, 32)
+            weights_trt = weights_trt.reshape(112, 4, 4, 16, 16, 32).transpose(-2, -3)
+            weights_trt = ExpertSelectUpGateSiLUWeightsConverter._swizzle_mma_16x32(weights_trt)
+            weights_trt = weights_trt.reshape(112, 4, 4 * 16 * 16 * 32)
+
+        # For scales
+        scales_trt = mat_scale_in.reshape(56, 16, 16)[:, 0, :]
+        scales_trt = scales_trt.reshape(56, 16)
+        return weights_trt.contiguous(), scales_trt.contiguous()
+
+
+class DownAllreduceWeightsConverter:
+    """Weights converter class."""
+
+    @staticmethod
+    def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
+        # PTX isa fig.88
+        pre_shape = mat_in.shape[:-2]
+        mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
+        return mat_in.reshape(*pre_shape, 2 * 2, 8 * 4, 4).transpose(-3, -2)
+
+    @staticmethod
+    def _swizzle_mma_8x32(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
+        # PTX isa fig.88
+        pre_shape = mat_in.shape[:-2]
+        return mat_in.reshape(*pre_shape, 8, 2, 4, 4).transpose(-2, -3).contiguous()
+
+    @staticmethod
+    def tilert_to_tilert_mma(
+        mat_in: torch.Tensor, scale_in: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert tilert weights and scales to tilert_mma input format.
+
+        Args:
+            mat_in: tilert weights
+            mat_scale_in: tilert scales
+        Returns:
+            tilert_mma weights and scales
+        """
+        exp_num = mat_in.shape[0]
+        mat_in_s = mat_in.reshape(exp_num, 128, 56, 256)
+        # mat_in_s[:, :, 48:56] = 0;
+        mat_in_0 = mat_in_s[:, :, :16].reshape(exp_num, 128, 16, 8, 32).transpose(2, 3)
+        mat_in_0 = DownAllreduceWeightsConverter._swizzle_mma_16x32(mat_in_0).reshape(
+            exp_num, 128, -1
+        )
+        mat_in_1 = mat_in_s[:, :, 16:32].reshape(exp_num, 128, 16, 8, 32).transpose(2, 3)
+        mat_in_1 = DownAllreduceWeightsConverter._swizzle_mma_16x32(mat_in_1).reshape(
+            exp_num, 128, -1
+        )
+        mat_in_2 = mat_in_s[:, :, 32:48].reshape(exp_num, 128, 16, 8, 32).transpose(2, 3)
+        mat_in_2 = DownAllreduceWeightsConverter._swizzle_mma_16x32(mat_in_2).reshape(
+            exp_num, 128, -1
+        )
+        mat_in_3 = mat_in_s[:, :, 48:56].reshape(exp_num, 128, 8, 8, 32).transpose(2, 3)
+        mat_in_3 = DownAllreduceWeightsConverter._swizzle_mma_8x32(mat_in_3).reshape(
+            exp_num, 128, -1
+        )
+
+        mat_in_swizzled = torch.cat([mat_in_0, mat_in_1, mat_in_2, mat_in_3], dim=2)
+        return mat_in_swizzled.reshape(exp_num, 7168, 256).contiguous(), scale_in

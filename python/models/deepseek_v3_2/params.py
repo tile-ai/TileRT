@@ -2,7 +2,8 @@ from abc import abstractmethod
 
 import torch
 
-from tilert.models.utils import SwizzleMode, gen_tensor_swizzle_map_1d
+from tilert.models.deepseek_v3_2.model_args import ModelArgs as ModelArgsV3_2
+from tilert.models.utils import SwizzleMode, gen_tensor_swizzle_map_1d, precompute_freqs_cis
 
 __all__ = [
     "IntermediateMapper",
@@ -196,6 +197,33 @@ class BaseParams:
         raise NotImplementedError("Subclasses must implement this method")
 
 
+class PlaceHolderParams(BaseParams):
+    def __init__(self) -> None:
+        super().__init__()
+
+    @staticmethod
+    def num_params() -> int:
+        return 0
+
+
+class EmbeddingParams(BaseParams):
+    def __init__(
+        self,
+        embedding: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        super().__init__()
+        self.embedding = self.register_params(embedding)
+        self.freqs_cis = self.register_params(freqs_cis)
+
+    @staticmethod
+    def num_params() -> int:
+        return 1
+
+    def to_dict(self, device_id: int) -> dict[str, torch.Tensor]:
+        return {"model.embed_tokens.weight": self.embedding.to(device_id)}
+
+
 class MlaParams(BaseParams):
     def __init__(
         self,
@@ -337,47 +365,59 @@ class MoEParams(BaseParams):
         }
 
 
-class MlaFp8Params(BaseParams):
+class LLMHeadParams(BaseParams):
+    """LLM Head Parameters"""
+
     def __init__(
         self,
-        unproj_o_weights_and_scales: torch.Tensor,
+        hidden_rms_gamma: torch.Tensor,
+        head_proj_weights: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.unproj_o_weights_and_scales = self.register_params(unproj_o_weights_and_scales)
-
-    @staticmethod
-    def num_params() -> int:
-        return 1
-
-
-class MLPFp8Params(BaseParams):
-    def __init__(
-        self,
-        upgate_weights_and_scales: torch.Tensor,
-        down_weights_and_scales: torch.Tensor,
-    ) -> None:
-        super().__init__()
-        self.upgate_weights_and_scales = self.register_params(upgate_weights_and_scales)
-        self.down_weights_and_scales = self.register_params(down_weights_and_scales)
+        self.hidden_rms_gamma = self.register_params(hidden_rms_gamma)
+        self.head_proj_weights = self.register_params(head_proj_weights)
 
     @staticmethod
     def num_params() -> int:
         return 2
 
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_model.norm.weight_dev_{device_id}": self.hidden_rms_gamma.to(
+                device_id
+            ),
+            f"layer_{layer_id}_lm_head.weight_dev_{device_id}": self.head_proj_weights.to(
+                device_id
+            ),
+        }
 
-class MoEFp8Params(BaseParams):
+
+class MTPPreprocessParams(BaseParams):
     def __init__(
         self,
-        exp_upgate_weights_and_scales: torch.Tensor,
-        exp_down_weights_and_scales: torch.Tensor,
+        embedding_rmsnorm_gamma: torch.Tensor,
+        hidden_rmsnorm_gamma: torch.Tensor,
+        eh_proj_weights: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.exp_upgate_weights_and_scales = self.register_params(exp_upgate_weights_and_scales)
-        self.exp_down_weights_and_scales = self.register_params(exp_down_weights_and_scales)
+        self.embedding_rmsnorm_gamma = self.register_params(embedding_rmsnorm_gamma)
+        self.hidden_rmsnorm_gamma = self.register_params(hidden_rmsnorm_gamma)
+        self.eh_proj_weights = self.register_params(eh_proj_weights)
 
     @staticmethod
     def num_params() -> int:
-        return 2
+        return 3
+
+    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
+        return {
+            f"layer_{layer_id}_embedding_rmsnorm_gamma_dev_{device_id}": (
+                self.embedding_rmsnorm_gamma.to(device_id)
+            ),
+            f"layer_{layer_id}_hidden_rmsnorm_gamma_dev_{device_id}": self.hidden_rmsnorm_gamma.to(
+                device_id
+            ),
+            f"layer_{layer_id}_eh_proj_weights_dev_{device_id}": self.eh_proj_weights.to(device_id),
+        }
 
 
 class TempVars(BaseParams):
@@ -409,6 +449,19 @@ class TempVars(BaseParams):
         x_rmsnorm: torch.Tensor,
         logits_out: torch.Tensor,
         token_out: torch.Tensor,
+        embedding_rmsnorm: torch.Tensor,
+        hidden_rmsnorm: torch.Tensor,
+        eh_proj: torch.Tensor,
+        x_tensor: torch.Tensor,
+        rope_freqs: torch.Tensor,
+        cur_pos: torch.Tensor,
+        token_id: torch.Tensor,
+        last_hidden_states: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        predicted_tokens: torch.Tensor,
+        predicted_hidden: torch.Tensor,
+        accepted_tokens: torch.Tensor,
+        next_draft_tokens: torch.Tensor,
     ) -> None:
         super().__init__()
         self.q = self.register_params(q)
@@ -437,10 +490,23 @@ class TempVars(BaseParams):
         self.x_rmsnorm = self.register_params(x_rmsnorm)
         self.logits_out = self.register_params(logits_out)
         self.token_out = self.register_params(token_out)
+        self.embedding_rmsnorm = self.register_params(embedding_rmsnorm)
+        self.hidden_rmsnorm = self.register_params(hidden_rmsnorm)
+        self.eh_proj = self.register_params(eh_proj)
+        self.x_tensor = self.register_params(x_tensor)
+        self.rope_freqs = self.register_params(rope_freqs)
+        self.cur_pos = self.register_params(cur_pos)
+        self.token_id = self.register_params(token_id)
+        self.last_hidden_states = self.register_params(last_hidden_states)
+        self.draft_tokens = self.register_params(draft_tokens)
+        self.predicted_tokens = self.register_params(predicted_tokens)
+        self.predicted_hidden = self.register_params(predicted_hidden)
+        self.accepted_tokens = self.register_params(accepted_tokens)
+        self.next_draft_tokens = self.register_params(next_draft_tokens)
 
     @staticmethod
     def num_params() -> int:
-        return 26
+        return 39
 
     def tot_size_in_bytes_aligned(self, aligned_size: int) -> int:
         tot_size: int = 0
@@ -482,28 +548,395 @@ class CacheVars(BaseParams):
         return 3
 
 
-class LLMHeadParams(BaseParams):
-    """LLM Head Parameters"""
+class Dsa671BModelInitializer:
+    """DSA with MTP e2e model for DeepSeek v3.2"""
+
+    # TODO: These parameters should be carefully checked
+    BATCH_SIZE = 1
+    MAX_SEQ_LEN = 4
+    NUM_HEADS = 16
+    NUM_KI_HEADS = 64
+
+    MAX_OPS = 2048
+    MAX_SEL_TOKENS = 2048
+    MAX_CTX_LEN = 16384
+    NUM_DENSE_LAYERS = 3
+    NUM_MOE_LAYERS = 58
+    NUM_LAYERS = NUM_DENSE_LAYERS + NUM_MOE_LAYERS
+
+    HIDDEN_SIZE = 7168
+    PE_LORA_DIM = 64
+    Q_NOPE_DIM = 128
+
+    Q_DIM = 1536
+    KV_CACHE_DIM = 512
+    PE_CACHE_DIM = 64
+    KI_CACHE_DIM = 128
+    Q_PE_DIM = 512
+    V_HEAD_DIM = 128
+
+    N_ROUTED_EXPERTS = 256
+    N_ACTIVATE_EXPERTS = 8
+    N_TOTAL_EXPERTS = N_ACTIVATE_EXPERTS + 1
+    EXP_DIMS = 256
+
+    FULL_VOCAB_SIZE = 129280
+    VOCAB_SIZE = FULL_VOCAB_SIZE // 8  # 16160
 
     def __init__(
         self,
-        hidden_rms_gamma: torch.Tensor,
-        head_proj_weights: torch.Tensor,
+        device: torch.device,
+        max_seq_len: int | None = None,
+        max_ctx_len: int | None = None,
+        with_weight_conversion: bool = True,
+        with_mtp: bool = False,
     ) -> None:
         super().__init__()
-        self.hidden_rms_gamma = self.register_params(hidden_rms_gamma)
-        self.head_proj_weights = self.register_params(head_proj_weights)
 
-    @staticmethod
-    def num_params() -> int:
-        return 2
+        self.device = device
+        self.max_seq_len = max_seq_len if max_seq_len is not None else self.MAX_SEQ_LEN
+        self.max_ctx_len = max_ctx_len if max_ctx_len is not None else self.MAX_CTX_LEN
+        self.with_weight_conversion = with_weight_conversion
+        self.with_mtp = with_mtp
 
-    def to_dict(self, layer_id: int, device_id: int) -> dict[str, torch.Tensor]:
-        return {
-            f"layer_{layer_id}_model.norm.weight_dev_{device_id}": self.hidden_rms_gamma.to(
-                device_id
-            ),
-            f"layer_{layer_id}_lm_head.weight_dev_{device_id}": self.head_proj_weights.to(
-                device_id
-            ),
-        }
+        self.bf16_desc = {"dtype": torch.bfloat16, "device": device}
+        self.fp16_desc = {"dtype": torch.float16, "device": device}
+        self.fp32_desc = {"dtype": torch.float32, "device": device}
+        self.uint64_desc = {"dtype": torch.uint64, "device": device}
+        self.int32_desc = {"dtype": torch.int32, "device": device}
+        self.uint8_desc = {"dtype": torch.uint8, "device": device}
+
+        self.mtp_params_sidx = 0
+
+    def register_weights_and_scales(
+        self, dim1: int, dim2: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        block_size = 128
+        weights_dims = (dim1, dim2)
+        weights = torch.randn(weights_dims, **self.bf16_desc).to(torch.float8_e4m3fn)
+        scales = torch.randn((dim1, dim2 // block_size), **self.bf16_desc)
+        return weights, scales
+
+    def init_llm_head_params(self) -> LLMHeadParams:
+        from tilert.models.preprocess.weight_utils import RMSNormHeadProjWeightsConverter
+
+        hidden_rms_gamma_shape = (self.HIDDEN_SIZE,)
+        head_proj_weights_shape = (self.VOCAB_SIZE, self.HIDDEN_SIZE)
+
+        hidden_rms_gamma = torch.randn(hidden_rms_gamma_shape, **self.fp32_desc)
+        head_proj_weights = torch.randn(head_proj_weights_shape, **self.bf16_desc)
+
+        if self.with_weight_conversion:
+            # Apply weight conversion for LLM head
+            head_proj_weights = (
+                RMSNormHeadProjWeightsConverter.tilert_to_tilert_native_bf16_warp_gemv(
+                    head_proj_weights
+                )
+            )
+
+        return LLMHeadParams(
+            hidden_rms_gamma,
+            head_proj_weights,
+        )
+
+    def init_embedding_params(self) -> EmbeddingParams:
+        embedding = torch.randn(self.FULL_VOCAB_SIZE, self.HIDDEN_SIZE, **self.bf16_desc)
+        freqs_cis = precompute_freqs_cis(ModelArgsV3_2())
+        freqs_cis = torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], -1)
+        return EmbeddingParams(embedding, freqs_cis.to(self.device))
+
+    def init_mla_params(self) -> MlaParams:
+        from tilert.models.preprocess.weight_utils import (
+            RMSNormProjQAKVAKIWeightsConverter,
+        )
+
+        qkv_dim = self.Q_DIM + self.KV_CACHE_DIM + self.PE_LORA_DIM + 128
+        x_rmsnorm_gamma_shape = (self.HIDDEN_SIZE,)
+        q_wb_shape = ((self.PE_LORA_DIM + self.Q_NOPE_DIM + 512) * self.NUM_HEADS, self.Q_DIM)
+        wkv_b1_shape = (self.NUM_HEADS, self.KV_CACHE_DIM, self.V_HEAD_DIM)
+        wkv_b2_shape = (self.NUM_HEADS, self.V_HEAD_DIM, self.KV_CACHE_DIM)
+        wkv_b2_scales_shape = (self.NUM_HEADS, self.V_HEAD_DIM // 128, self.KV_CACHE_DIM // 128)
+        unproj_w_shape = (self.HIDDEN_SIZE, self.NUM_HEADS * self.V_HEAD_DIM)
+        unproj_scales_shape = (896, self.NUM_HEADS * self.V_HEAD_DIM // 128)
+
+        x_rmsnorm_gamma = torch.randn(x_rmsnorm_gamma_shape, **self.fp32_desc)
+        qkv_wa_weights, _ = self.register_weights_and_scales(qkv_dim, self.HIDDEN_SIZE)
+        qkv_wa_scales = torch.randn((130, 64), **self.bf16_desc)
+        k_weights = torch.randn(128, **self.fp32_desc)
+        k_bias = torch.randn(128, **self.fp32_desc)
+        q_rmsnorm_gamma = torch.randn(self.Q_DIM, **self.fp32_desc)
+        q_wb_weights, _ = self.register_weights_and_scales(*q_wb_shape)
+        q_wb_scales = torch.randn((448, 12), **self.bf16_desc)
+        id_score_weights = torch.randn(64, self.HIDDEN_SIZE, **self.bf16_desc)
+        wkv_b1_weights = torch.randn(wkv_b1_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        wkv_b1_scales = torch.randn((16, 8, 1), **self.bf16_desc)
+        kv_rmsnorm_gamma = torch.randn(self.KV_CACHE_DIM, **self.fp32_desc)
+        wkv_b2_weights = torch.randn(wkv_b2_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        wkv_b2_scales = torch.randn(wkv_b2_scales_shape, **self.bf16_desc)
+        unproj_weights = torch.randn(unproj_w_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        unproj_scales = torch.randn(unproj_scales_shape, **self.bf16_desc)
+
+        if self.with_weight_conversion:
+            # Apply weight conversion for MLA qkv_wa weights
+            # Convert tilert format -> common format -> tilert native bf16 warp gemv format
+            common_weights = RMSNormProjQAKVAKIWeightsConverter.tilert_to_common(
+                qkv_wa_weights, qkv_wa_scales, x_rmsnorm_gamma
+            )
+            qkv_wa_weights, x_rmsnorm_gamma = (
+                RMSNormProjQAKVAKIWeightsConverter.common_to_tilert_native_bf16_warp_gemv(
+                    *common_weights
+                )
+            )
+
+        return MlaParams(
+            x_rmsnorm_gamma=x_rmsnorm_gamma,
+            qkv_wa_weights=qkv_wa_weights,
+            qkv_wa_scales=qkv_wa_scales,
+            k_weights=k_weights,
+            k_bias=k_bias,
+            q_rmsnorm_gamma=q_rmsnorm_gamma,
+            q_wb_weights=q_wb_weights,
+            q_wb_scales=q_wb_scales,
+            id_score_weights=id_score_weights,
+            wkv_b1_weights=wkv_b1_weights,
+            wkv_b1_scales=wkv_b1_scales,
+            kv_rmsnorm_gamma=kv_rmsnorm_gamma,
+            wkv_b2_weights=wkv_b2_weights,
+            wkv_b2_scales=wkv_b2_scales,
+            unproj_weights=unproj_weights,
+            unproj_scales=unproj_scales,
+        )
+
+    def init_mlp_params(self) -> MLPParams:
+        exp_upgate_w_shape = (9, self.EXP_DIMS * 2, self.HIDDEN_SIZE)
+        exp_upgate_s_shape = (9, self.EXP_DIMS * 2 // 128, 64)
+        exp_down_w_shape = (9, self.HIDDEN_SIZE, self.EXP_DIMS)
+        exp_down_s_shape = (9, 1024, self.EXP_DIMS // 128)
+
+        unproj_o_gamma = torch.randn(self.HIDDEN_SIZE, **self.fp32_desc)
+        upgate_weights = torch.randn(exp_upgate_w_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        upgate_scales = torch.randn(exp_upgate_s_shape, **self.bf16_desc)
+        down_weights = torch.randn(exp_down_w_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        down_scales = torch.randn(exp_down_s_shape, **self.bf16_desc)
+
+        return MLPParams(
+            unproj_o_gamma,
+            upgate_weights,
+            upgate_scales,
+            down_weights,
+            down_scales,
+        )
+
+    def init_moe_params(self) -> MoEParams:
+        from tilert.models.preprocess.weight_utils import (
+            ExpertSelectUpGateSiLUWeightsConverter,
+        )
+
+        exp_ug_w_shape = (self.N_ROUTED_EXPERTS + 1, self.EXP_DIMS * 2, self.HIDDEN_SIZE)
+        exp_upgate_s_shape = (self.N_ROUTED_EXPERTS + 1, self.EXP_DIMS * 2 // 128, 64)
+        exp_down_w_shape = (self.N_ROUTED_EXPERTS + 1, self.HIDDEN_SIZE, self.EXP_DIMS)
+        exp_down_s_shape = (self.N_ROUTED_EXPERTS + 1, 1024, self.EXP_DIMS // 128)
+
+        unproj_o_gamma = torch.randn(self.HIDDEN_SIZE, **self.fp32_desc)
+        exp_proj_weights = torch.randn((self.N_ROUTED_EXPERTS, self.HIDDEN_SIZE), **self.bf16_desc)
+        exp_bias = torch.randn(self.N_ROUTED_EXPERTS, **self.fp32_desc)
+        exp_upgate_weights = torch.randn(exp_ug_w_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        exp_upgate_scales = torch.randn(exp_upgate_s_shape, **self.bf16_desc)
+        exp_down_weights = torch.randn(exp_down_w_shape, **self.fp16_desc).to(torch.float8_e4m3fn)
+        exp_down_scales = torch.randn(exp_down_s_shape, **self.bf16_desc)
+
+        if self.with_weight_conversion:
+            # Apply weight conversion for MOE exp_upgate weights
+            exp_upgate_weights = ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm_mma(
+                exp_upgate_weights, exp_upgate_scales
+            )
+
+        return MoEParams(
+            unproj_o_gamma,
+            exp_proj_weights,
+            exp_bias,
+            exp_upgate_weights,
+            exp_upgate_scales,
+            exp_down_weights,
+            exp_down_scales,
+        )
+
+    def init_mtp_preprocess_params(self) -> MTPPreprocessParams:
+        """Initialize MTP preprocess parameters with random values."""
+        embedding_rmsnorm_gamma = torch.randn(self.HIDDEN_SIZE, **self.fp32_desc)
+        hidden_rmsnorm_gamma = torch.randn(self.HIDDEN_SIZE, **self.fp32_desc)
+        eh_proj_weights = torch.randn((128, 7, 56, 256), **self.bf16_desc)
+        return MTPPreprocessParams(
+            embedding_rmsnorm_gamma,
+            hidden_rmsnorm_gamma,
+            eh_proj_weights,
+        )
+
+    def acquire_params(self) -> list[torch.Tensor]:
+        params = []
+
+        for _ in range(self.NUM_DENSE_LAYERS):
+            params.extend(self.init_mla_params().get_params())
+            params.extend(self.init_mlp_params().get_params())
+
+        for _ in range(self.NUM_MOE_LAYERS):
+            params.extend(self.init_mla_params().get_params())
+            params.extend(self.init_moe_params().get_params())
+
+        params.extend(self.init_llm_head_params().get_params())
+        params.extend(self.init_embedding_params().get_params())
+
+        if self.with_mtp:
+            self.mtp_params_sidx = len(params)
+            params.extend(self.init_embedding_params().get_params())
+            params.extend(self.init_mtp_preprocess_params().get_params())
+            params.extend(self.init_mla_params().get_params())
+            params.extend(self.init_moe_params().get_params())
+            params.extend(self.init_llm_head_params().get_params())
+
+        return params
+
+    def acquire_temp_vars(self, seq_len: int | None = None) -> TempVars:
+        """Acquire temporary variables for the model.
+
+        Args:
+            seq_len: Sequence length for temp vars. If None, uses self.max_seq_len.
+
+        Returns:
+            TempVars object containing all temporary tensors.
+        """
+        seq_len = seq_len if seq_len is not None else self.max_seq_len
+        BATCH_SEQ = (self.BATCH_SIZE, seq_len)
+
+        q = torch.zeros(*BATCH_SEQ, self.Q_DIM, **self.bf16_desc)
+        kv = torch.zeros(*BATCH_SEQ, self.KV_CACHE_DIM, **self.bf16_desc)
+        q_pe = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, self.PE_LORA_DIM, **self.bf16_desc)
+        ki = torch.zeros(*BATCH_SEQ, self.KI_CACHE_DIM, **self.bf16_desc)
+        q_nope_down = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, self.V_HEAD_DIM, **self.bf16_desc)
+        q_nope = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, self.Q_PE_DIM, **self.bf16_desc)
+        iq = torch.zeros(*BATCH_SEQ, self.NUM_KI_HEADS, self.KI_CACHE_DIM, **self.bf16_desc)
+        iq_rt = torch.zeros(*BATCH_SEQ, self.NUM_KI_HEADS, self.KI_CACHE_DIM, **self.bf16_desc)
+        idx_score = torch.zeros(*BATCH_SEQ, self.NUM_KI_HEADS, **self.bf16_desc)
+        idx_logits = torch.zeros(*BATCH_SEQ, self.max_ctx_len, **self.fp32_desc)
+        idx_sels = torch.zeros(*BATCH_SEQ, self.MAX_SEL_TOKENS, **self.int32_desc)
+        o = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, self.KV_CACHE_DIM, **self.bf16_desc)
+        o_acc = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, 32, self.KV_CACHE_DIM, **self.fp32_desc)
+        o_lse = torch.empty(*BATCH_SEQ, self.NUM_HEADS, **self.fp32_desc)
+        o_lse_acc = torch.empty(*BATCH_SEQ, self.NUM_HEADS, 32, **self.fp32_desc)
+        proj_o = torch.zeros(*BATCH_SEQ, self.NUM_HEADS, self.V_HEAD_DIM, **self.bf16_desc)
+        unproj_o = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        scores = torch.zeros(*BATCH_SEQ, self.N_ROUTED_EXPERTS, **self.fp32_desc)
+        x_mlp_in = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        exp_up_gate = torch.zeros(*BATCH_SEQ, self.N_TOTAL_EXPERTS, self.EXP_DIMS, **self.bf16_desc)
+        sel_probs = torch.zeros(*BATCH_SEQ, self.N_ACTIVATE_EXPERTS, **self.fp32_desc)
+        sel_indices = torch.zeros(*BATCH_SEQ, self.N_ACTIVATE_EXPERTS, **self.int32_desc)
+        exp_out = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        x_rmsnorm = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        logits_out = torch.zeros(*BATCH_SEQ, self.VOCAB_SIZE, **self.fp32_desc)
+        token_out = torch.zeros(*BATCH_SEQ, 1, **self.int32_desc)
+
+        embedding_rmsnorm = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        hidden_rmsnorm = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        eh_proj = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        x_tensor = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        rope_freqs = torch.zeros(*BATCH_SEQ, self.PE_CACHE_DIM, **self.fp32_desc)
+        cur_pos = torch.zeros(self.BATCH_SIZE, **self.int32_desc)
+        token_id = torch.zeros(*BATCH_SEQ, 1, **self.int32_desc)
+        last_hidden_states = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+
+        draft_tokens = torch.zeros(*BATCH_SEQ, **self.int32_desc)
+        predicted_tokens = torch.zeros(*BATCH_SEQ, 1, **self.int32_desc)
+        predicted_hidden = torch.zeros(*BATCH_SEQ, self.HIDDEN_SIZE, **self.bf16_desc)
+        accepted_tokens = torch.zeros(self.BATCH_SIZE, **self.int32_desc)
+        next_draft_tokens = torch.zeros(*BATCH_SEQ, **self.int32_desc)
+
+        return TempVars(
+            q,
+            kv,
+            ki,
+            q_nope_down,
+            q_pe,
+            iq,
+            iq_rt,
+            idx_score,
+            idx_logits,
+            idx_sels,
+            q_nope,
+            o,
+            o_acc,
+            o_lse,
+            o_lse_acc,
+            proj_o,
+            unproj_o,
+            scores,
+            x_mlp_in,
+            exp_up_gate,
+            sel_probs,
+            sel_indices,
+            exp_out,
+            x_rmsnorm,
+            logits_out,
+            token_out,
+            embedding_rmsnorm,
+            hidden_rmsnorm,
+            eh_proj,
+            x_tensor,
+            rope_freqs,
+            cur_pos,
+            token_id,
+            last_hidden_states,
+            draft_tokens,
+            predicted_tokens,
+            predicted_hidden,
+            accepted_tokens,
+            next_draft_tokens,
+        )
+
+    def acquire_cache_vars(self, num_layers: int | None = None) -> list[torch.Tensor]:
+        """Acquire cache variables for the model.
+
+        Args:
+            num_layers: Number of layers to create cache for. If None, uses NUM_LAYERS.
+
+        Returns:
+            List of cache tensors (3 tensors per layer: k_cache, kv_cache, pe_cache).
+        """
+        num_layers = num_layers if num_layers is not None else self.NUM_LAYERS
+        if self.with_mtp:
+            num_layers += 1
+
+        BATCH_CTX = (self.BATCH_SIZE, self.max_ctx_len)
+        cache_vars = []
+        for _ in range(num_layers):
+            cache_vars.extend(
+                [
+                    torch.zeros(*BATCH_CTX, self.KI_CACHE_DIM, **self.bf16_desc),
+                    torch.zeros(*BATCH_CTX, self.KV_CACHE_DIM, **self.bf16_desc),
+                    torch.zeros(*BATCH_CTX, self.PE_CACHE_DIM, **self.bf16_desc),
+                ]
+            )
+        return cache_vars
+
+    def acquire_single_layer_cache_vars(self) -> list[torch.Tensor]:
+        """Acquire cache variables for a single layer.
+
+        Returns:
+            List of 3 cache tensors: k_cache, kv_cache, pe_cache.
+        """
+        return self.acquire_cache_vars(num_layers=1)
+
+    def acquire_misc_vars(self) -> list[torch.Tensor]:
+        return [
+            torch.zeros(self.MAX_OPS, 148, 16, **self.uint64_desc),
+            torch.zeros(self.MAX_OPS, 128, **self.uint8_desc),
+            torch.zeros(self.MAX_OPS, 8, **self.uint8_desc),
+        ]
+
+    def get_mtp_all_vars(self) -> list[torch.Tensor]:
+        return [
+            self.acquire_params()[self.mtp_params_sidx :],
+            self.acquire_temp_vars().get_params(),
+            self.acquire_cache_vars()[-3:],
+            # Potential issue: Reallocate misc vars for MTP
+            self.acquire_misc_vars(),
+        ]

@@ -40,7 +40,8 @@ def _load_library(filename: str) -> Any:
     lib_path = Path(__file__).parent / filename
 
     try:
-        return ctypes.CDLL(str(lib_path))
+        torch.ops.load_library(str(lib_path))
+        return lib_path
     except Exception as e:
         raise RuntimeError(f"Failed to load library from {lib_path}") from e
 

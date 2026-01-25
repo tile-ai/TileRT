@@ -48,7 +48,9 @@ def cosine_similarity(gt: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     Returns:
         The cosine similarity.
     """
-    return torch.nn.functional.cosine_similarity(gt.flatten(), out.flatten(), dim=-1)
+    return torch.nn.functional.cosine_similarity(
+        gt.flatten().float(), out.flatten().float(), dim=-1
+    )
 
 
 def relative_l2_error(gt: torch.Tensor, out: torch.Tensor) -> Any:

@@ -126,6 +126,7 @@ def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tenso
     return y_out.to(dtype)
 
 
+# enumerate swizzle mode
 class SwizzleMode(IntEnum):
     """Swizzle mode."""
 
@@ -135,6 +136,7 @@ class SwizzleMode(IntEnum):
     SWIZZLE_128B = 128 // 16
 
 
+# See CUDA C++ programming Guide 10.29.3.2 for more details.
 def gen_tensor_swizzle_map_1d(
     rows: int, cols_in_16bytes: int, swizzle_mode: SwizzleMode = SwizzleMode.SWIZZLE_128B
 ) -> torch.Tensor:
