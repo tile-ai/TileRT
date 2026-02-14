@@ -20,30 +20,39 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- :fire: **2026-01-26 · [v0.1.2-alpha.1](https://github.com/tile-ai/TileRT/releases/tag/v0.1.2-alpha.1)**. **Multi-Token Prediction (MTP) lands in TileRT**. With mtp=3, we observe decoding rates up to **590 tokens/s** under synthetic workloads.
+- :fire: **2026-02-14 · [Try the Online Demo](https://www.tilert.ai/)**. Our online demo is now live! Experience ultra-low-latency inference with **GLM-5** and **DeepSeek-V3.2**. [Try it now !](https://www.tilert.ai)
+
+- 🎉 **2026-02-14 · [v0.1.3](https://github.com/tile-ai/TileRT/releases/tag/v0.1.3) Released**. The v0.1.3 release introduces full support for the latest GLM-5 model, achieving up to 500 tokens/s on GLM-5-FP8 and up to 600 tokens/s on DeepSeek-V3.2.
+
+- 🚀 **2026-01-26 · [v0.1.2-alpha.1](https://github.com/tile-ai/TileRT/releases/tag/v0.1.2-alpha.1)**. **Multi-Token Prediction (MTP)** is now available in TileRT! With mtp=3, we achieve decoding rates of up to **590 tokens/s** under synthetic workloads.
+
+<details>
+  <summary>Key Milestones</summary>
 
 - ⚡ **2025-12-23 · [v0.1.1](https://github.com/tile-ai/TileRT/releases/tag/v0.1.1)**. Achieved ~**35% further reduction** (3 ~ 4x speedup over baseline) in end-to-end token generation latency on a single node with **8× NVIDIA B200**.
 
 - 🚀 **2025-11-20 · [v0.1.0-alpha.1](https://github.com/tile-ai/TileRT/releases/tag/v0.1.0-alpha.1)**. Initial public release for **DeepSeek-V3.2-Exp**, targeting **ultra-low-latency** inference. Available on [PyPI](https://pypi.org/project/tilert) and [HuggingFace](https://huggingface.co/Tile-AI/DeepSeek-V3.2-Exp-TileRT).
 
+</details>
+
 ______________________________________________________________________
 
 <a id="overview"></a>
 
-## TileRT: Pushing LLM Latency to the Limit
+**TileRT** is a project designed to serve large language models (LLMs) in ultra-low-latency scenarios. Its goal is to push the latency limits of LLMs without compromising model size or quality—enabling models with hundreds of billions of parameters to achieve millisecond-level time per output token (TPOT).
 
-TileRT is an experimental project exploring core compiler techniques for serving large language models (LLMs) in **ultra-low-latency** scenarios. Its goal is to push the latency limits of LLMs without compromising model size or quality—for example, enabling models with hundreds of billions of parameters to achieve millisecond-level **time per output token (TPOT)**.
+In our latest **v0.1.3** release, we tested **TileRT's** performance on the newest [**GLM-5**](https://huggingface.co/zai-org/GLM-5-FP8) model, demonstrating the effectiveness of our approach in real-world applications. We were among the first to support this latest model, validating the power of the technology we've developed.
+
+Using the [**GLM-5**](https://huggingface.co/zai-org/GLM-5-FP8) model (without lossy optimizations such as quantization or distillation) with a batch size of 1 on 8× NVIDIA B200 GPUs, we evaluated TileRT’s preliminary performance. As shown in the benchmarks below, TileRT demonstrates substantial improvements over existing inference systems.
 
 <p align="center">
-<img src="assets/generate.gif" alt="TileRT Benchmark"><br>
-Figure 1. Sequence generation with TileRT, now enhanced with Multi-Token Prediction (MTP) to accelerate inference.
+<img src="assets/glm5-mtp.png" alt="TileRT Benchmark" width="800"><br>
+Figure 1. Evaluation setup. Batch size: 1; Input sequence length: 1K, 16K, 32K, 64K, 128K, 150K, 192K; Output sequence length: 1K; Benchmark with <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/bench/dataset/prepare_synthetic_data.py">synthetic data</a>. SGLang v0.5.9.dev0 with MTP=3; vLLM v0.16.0rc2.dev173 with MTP=1 (vLLM failed when MTP=3, so we set MTP=1 as <a href="https://docs.vllm.ai/projects/recipes/en/latest/GLM/GLM5.html">vLLM-GPT5-recipe</a>); TileRT v0.1.3 with MTP=3.
 </p>
 
-We evaluated TileRT’s preliminary performance using the [**DeepSeek-V3.2-Exp**](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model (without lossy optimizations such as quantization or distillation) with a batch size of 1 on 8× NVIDIA B200 GPUs. As shown in the benchmark below, TileRT demonstrates substantial improvements over existing inference systems.
-
 <p align="center">
-<img src="assets/perf.png" alt="TileRT Benchmark" width="500"><br>
-Figure 2. Evaluation setup. Batch size: 1, Input sequence length/Output sequence length: 1K/1K; SGLang v0.5.6, TensorRT-LLM v1.2.0-rc5, vLLM v0.13.0, TileRT v0.1.1 with CUDA 12.9.
+<img src="assets/glm5-without-mtp.png" alt="TileRT Benchmark" width="800"><br>
+Figure 2. Evaluation setup. Batch size: 1; Input sequence length: 1K, 16K, 32K, 64K, 128K, 150K, 192K; Output sequence length: 1K; Benchmark with <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/bench/dataset/prepare_synthetic_data.py">synthetic data</a>. SGLang v0.5.9.dev0; vLLM v0.16.0rc2.dev173; TileRT v0.1.3.
 </p>
 
 Unlike traditional inference systems optimized for high-throughput batch processing, TileRT prioritizes **responsiveness**, which is critical for applications such as high-frequency trading, interactive AI, real-time decision-making, long-running agents, and AI-assisted coding, where the latency of individual requests matters most.
@@ -117,35 +126,45 @@ You're now ready to use TileRT! Proceed to the [Getting Started](#getting-starte
 
 ## Getting Started
 
-### Download Pre-Converted Weights from HuggingFace
+### Step 1: Download Official Model Weights
 
-TileRT requires preprocessing of the original DeepSeek-V3.2-Exp model weights before they can be used for ultra-low-latency inference.
-To simplify this process, we provide **pre-converted weights** directly on HuggingFace so users do not need to run the preprocessing pipeline themselves.
+Starting from release v0.1.3, TileRT no longer requires downloading pre-converted weights from Hugging Face. Instead, you can download the official model weights directly from the model's source (e.g., Hugging Face), and then convert them using the weight converter script included with the latest TileRT release.
 
-You can download the weights using one of the recommended methods below:
+### Step 2: Convert Weights Using `weight_converter.py`
 
-#### Option 1: Using `huggingface-cli` (recommended)
+After downloading the official model weights, you can use the following command to convert them into a format compatible with TileRT:
 
-```bash
-hf download Tile-AI/DeepSeek-V3.2-Exp-TileRT --local-dir ./tilert_weights
-```
-
-This will download all files into the `./tilert_weights` directory.
-
-#### Option 2: Using Git + Git LFS
+For **DeepSeek-V3.2**, run:
 
 ```bash
-git lfs install
-git clone https://huggingface.co/Tile-AI/DeepSeek-V3.2-Exp-TileRT
+python -m tilert.models.preprocess.weight_converter \
+  --model_type deepseek-v32 \
+  --model_dir "/path/to/DeepSeek-V3.2" \
+  --save_dir "/path/to/DeepSeek-V3.2-TileRT"
 ```
 
-For additional download methods or advanced usage, please refer to the official Hugging Face documentation.
+Replace `/path/to/DeepSeek-V3.2` with the directory where you've downloaded the model weights, and `/path/to/DeepSeek-V3.2-TileRT` with the directory where you'd like the converted weights to be saved.
 
-After downloading the weights, point TileRT to the directory using:
+Similarly, for **GLM-5**, run:
 
 ```bash
-export MODEL_WEIGHTS_DIR=/path/to/tilert_weights
+python -m tilert.models.preprocess.weight_converter \
+  --model_type glm-5 \
+  --model_dir "/path/to/GLM-5-FP8" \
+  --save_dir "/path/to/GLM-5-FP8-TileRT"
 ```
+
+Replace `/path/to/GLM-5-FP8` with the directory containing the downloaded GLM-5 model weights, and `/path/to/GLM-5-FP8-TileRT` with the desired location for saving the converted weights.
+
+### Step 3: Set the Converted Weights Directory
+
+Once the weights are converted, set the environment variable to point TileRT to the directory containing the converted weights:
+
+```bash
+export MODEL_WEIGHTS_DIR= ... # converted weights
+```
+
+Now you're ready to use TileRT with the converted weights!
 
 ### Running the Generation Example
 
@@ -202,11 +221,6 @@ For example, TileRT may generate:
 This example demonstrates basic single-step autoregressive generation using the precompiled model.
 
 ### Running the Generation Example with Multi-Token Prediction (MTP)
-
-> \[!IMPORTANT\]
-> **Weights update required for MTP.** Multi-Token Prediction (MTP) introduces additional **MTP heads** in the model weights.
-> If you were using TileRT **before v0.1.1**, please make sure you download the **latest weights** from Hugging Face.
-> Older weights do not include the required MTP heads and will fail to run when MTP is enabled.
 
 TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth.
 

@@ -50,7 +50,6 @@ _load_library("libtilert.so")
 
 
 from . import models  # noqa: E402
-from .generate import ShowHandsGenerator  # noqa: E402
 from .models import deepseek_v3_2  # noqa: E402
 from .tilert_init import tilert_init  # noqa: E402
 
@@ -59,6 +58,5 @@ __all__ = [
     "tilert_init",
     "models",
     "deepseek_v3_2",
-    "ShowHandsGenerator",
     "__version__",
 ]

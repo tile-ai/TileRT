@@ -2,6 +2,7 @@
 
 import os
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any
 
 import torch
@@ -9,13 +10,24 @@ import torch.nn as nn
 
 from tilert import logger
 from tilert.models.deepseek_config import get_rank, get_world_size
-from tilert.models.deepseek_v3_2.params import BaseParams
-from tilert.models.preprocess import WeightLoader
+from tilert.models.deepseek_v3_2.model_args import ModelArgs
 from tilert.utils import get_profile_log_tensor
 
 __all__ = [
     "TileRTModule",
 ]
+
+
+class TilertWeightsConverter:
+    """Tilert weights converter"""
+
+    def __init__(self, model_args: ModelArgs, num_devices: int):
+        self.model_args = model_args
+        self.num_devices = num_devices
+
+    def dispatch(self, algorithm: Enum, weights: list[torch.Tensor]) -> Any:
+        dispatch_method = getattr(self, f"convert_to_{algorithm.value}")
+        return dispatch_method(weights)
 
 
 class TileRTModule(nn.Module, ABC):
@@ -33,6 +45,9 @@ class TileRTModule(nn.Module, ABC):
         tilert_weights_dir: str = "",
         layer_idx: int = 0,
         compute_kernel_type: str = "bf16",
+        model_args: ModelArgs | None = None,
+        num_devices: int = 8,
+        device_id: int = 0,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -48,6 +63,17 @@ class TileRTModule(nn.Module, ABC):
             **kwargs: Additional keyword arguments.
         """
         super().__init__(*args, **kwargs)
+
+        self.model_args = model_args if model_args is not None else ModelArgs()
+        self.num_devices = num_devices
+        self.device_id = device_id
+        self.algorithm: Enum | None = None
+
+        self.is_var_init = False
+        self.is_tilert_weights_init = False
+        self.is_ref_weights_init = False
+
+        self.profile_logs: torch.Tensor | None = None
 
         self.layer_idx = layer_idx
 
@@ -69,18 +95,24 @@ class TileRTModule(nn.Module, ABC):
         self.golden_weights_dir = golden_weights_dir
         self.tilert_weights_dir = tilert_weights_dir
 
-        self.weight_loader = WeightLoader(
-            layer_idx=layer_idx,
-            golden_weights_dir=golden_weights_dir,
-            tilert_weights_dir=tilert_weights_dir,
-        )
-
         self.profile_logs = get_profile_log_tensor()
 
-        # members for debugging
-        self.temp_dir = os.path.join(os.path.expanduser("~"), ".cache", "tilert")
-        os.makedirs(self.temp_dir, exist_ok=True)
-        self.tmp_vars: dict[str, torch.Tensor] = {}
+    def get_cache_vars(self) -> list[torch.Tensor]:
+        return []
+
+    def get_tilert_weights_alias(self) -> list[str]:
+        return list(self.tilert_weights_alias())
+
+    def get_ref_weights_alias(self) -> list[str]:
+        return list(self.ref_weights_alias())
+
+    def set_algorithm(self, algorithm: Enum) -> None:
+        """Set the algorithm for the module.
+
+        Args:
+            algorithm: Algorithm.
+        """
+        self.algorithm = algorithm
 
     def register_weights(self, weights_config: dict[str, dict[str, Any]]) -> None:
         """Register weights configuration.
@@ -89,75 +121,6 @@ class TileRTModule(nn.Module, ABC):
             weights_config: Dictionary mapping weight names to their configurations.
         """
         self.weight_loader.register_weights(weights_config)
-
-    def load_weights(self, device_id: int = 0) -> None:
-        """Load weights from the weights path."""
-        golden_weights_path = self.weight_loader.get_weight_file_path(
-            device_id=device_id, is_tilert=False
-        )
-        self.weight_loader.load_weights(weights_path=golden_weights_path, device_id=device_id)
-
-    def load_tilert_weights(self, device_id: int = 0) -> None:
-        """Load tilert weights from the weights path."""
-        tilert_weights_path = self.weight_loader.get_weight_file_path(
-            device_id=device_id, is_tilert=True
-        )
-        self.weight_loader.load_tilert_weights(
-            weights_path=tilert_weights_path, device_id=device_id
-        )
-
-    def get_weight(self, name: str, from_tilert: bool = False) -> Any:
-        """Get a weight by name.
-
-        Args:
-            name: Weight name.
-            from_tilert: Whether to get the weight from tilert.
-        """
-        return self.weight_loader.get_weight(name, from_tilert)
-
-    def wrap_var_name(self, var_name: str) -> str:
-        """Wrap the variable name.
-
-        Args:
-            var_name: Variable name.
-        """
-        return f"layer_{self.layer_idx}_{var_name}"
-
-    def register_tmp_var(self, var_name: str, var_tensor: torch.Tensor) -> None:
-        """Register a temporary variable for debugging.
-
-        Args:
-            var_name: Variable name.
-            var_tensor: Variable.
-        """
-        self.tmp_vars[self.wrap_var_name(var_name)] = var_tensor
-
-    def register_tmp_vars(self, var_dict: dict[str, torch.Tensor]) -> None:
-        """Register a list of temporary variables for debugging.
-
-        Args:
-            var_dict: Dictionary of variable names and variables.
-        """
-        for var_name, tensor in var_dict.items():
-            self.register_tmp_var(var_name, tensor)
-
-    def dump_tmp_vars(
-        self, tmp_vars: dict[str, torch.Tensor] | None = None, save_dir: str = ""
-    ) -> None:
-        """Dump variables to the profile log file.
-
-        Args:
-            tensor_vars: Dictionary of variable names and tensors.
-            save_dir: Directory to save the variables.
-        """
-        if tmp_vars is None:
-            tmp_vars = self.tmp_vars
-        save_dir = self.temp_dir if save_dir == "" else save_dir
-        os.makedirs(save_dir, exist_ok=True)
-
-        for tensor_name in tmp_vars:
-            logger.info(f"Saving variable {tensor_name} to {save_dir}")
-            torch.save(tmp_vars[tensor_name], os.path.join(save_dir, f"{tensor_name}.pt"))
 
     def get_profile_log_path(self) -> str:
         """Get the path to the profile log file.
@@ -216,17 +179,6 @@ class TileRTModule(nn.Module, ABC):
         del args, kwargs
         raise NotImplementedError("Tilert forward not implemented")
 
-    @abstractmethod
-    def to_tilert_weights(self, *args: Any, **kwargs: Any) -> BaseParams | None:
-        """Convert weights to tilert.
-
-        Args:
-            *args: Variable length argument list.
-            **kwargs: Arbitrary keyword arguments.
-        """
-        del args, kwargs
-        raise NotImplementedError("Convert weights to tilert not implemented")
-
     def enable_profiling_log(self, enable: bool = True) -> None:
         """Enable profiling log for this module and all submodules.
 
@@ -256,3 +208,120 @@ class TileRTModule(nn.Module, ABC):
                 module.flag_enable_tilert = enable
                 if enable:
                     module.to_tilert_weights()
+
+
+class SerializableTileRTModule(TileRTModule):
+    """Serializable TileRT module."""
+
+    def __init__(
+        self, model_args: ModelArgs, device_id: int, num_devices: int, remove_selected: bool = False
+    ):
+        super().__init__(
+            type(self).__name__, model_args=model_args, device_id=device_id, num_devices=num_devices
+        )
+        self.remove_selected = remove_selected
+
+        self.exec_seq: list[TileRTModule] = []
+        self.prefix_seq: list[str] = []
+        self.suffix_seq: list[str] = []
+        self.retain_weights_seq: list[bool] = []
+
+    def get_cache_vars(self) -> list[torch.Tensor]:
+        cache_vars = []
+        for op in self.exec_seq:
+            cache_vars.extend(op.get_cache_vars())
+        return cache_vars
+
+    def register_op(
+        self, op: TileRTModule, prefix: str = "", suffix: str = "", retain_weights: bool = False
+    ) -> None:
+        self.exec_seq.append(op)
+        self.prefix_seq.append(prefix)
+        self.suffix_seq.append(suffix)
+        self.retain_weights_seq.append(retain_weights)
+
+    def get_tilert_weights_alias(self) -> list[str]:
+        weights_alias: list[str] = []
+        for op in self.exec_seq:
+            weights_alias.extend(op.get_tilert_weights_alias())
+        return weights_alias
+
+    def get_ref_weights_alias(self) -> list[str]:
+        weights_alias: list[str] = []
+        for op in self.exec_seq:
+            weights_alias.extend(op.get_ref_weights_alias())
+        return weights_alias
+
+    def get_weights_list(self) -> list[torch.Tensor]:
+        weights = []
+        for op in self.exec_seq:
+            weights.extend(op.get_weights_list())
+        return weights
+
+    def device_sharding(self, raw_weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        sharded_weights_map: dict[str, torch.Tensor] = {}
+        for op in self.exec_seq:
+            sharded_weights_map.update(op.device_sharding(raw_weights_map))
+        return sharded_weights_map
+
+    @property
+    def tilert_tensor_alias(self) -> list[str]:
+        """Return tilert tensor alias of the first sub-op (RMSNormProjxWqkvia)."""
+        tensor_alias: list[str] = []
+        for op in self.exec_seq:
+            tensor_alias.extend(op.tilert_weights_alias())
+        return tensor_alias
+
+    @property
+    def ref_tensor_alias(self) -> list[str]:
+        """Return reference tensor alias of the first sub-op (RMSNormProjxWqkvia)."""
+        tensor_alias: list[str] = []
+        for op in self.exec_seq:
+            tensor_alias.extend(op.ref_weights_alias())
+        return tensor_alias
+
+    def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        for op, prefix, suffix, retain_weights in zip(
+            self.exec_seq, self.prefix_seq, self.suffix_seq, self.retain_weights_seq
+        ):
+            keys_to_remove = set()
+            op_state_dict = {}
+            for op_key in op.get_tilert_weights_alias():
+                original_key = f"{prefix}{op_key}{suffix}"
+                op_state_dict[op_key] = state_dict[original_key]
+                if self.remove_selected:
+                    keys_to_remove.add(original_key)
+            op.init_tilert_weights(op_state_dict)
+            if self.remove_selected and not retain_weights:
+                for k in keys_to_remove:
+                    del state_dict[k]
+
+    def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        for op in self.exec_seq:
+            op.init_reference_weights(state_dict)
+
+    def init_random_weights(self) -> None:
+        for op in self.exec_seq:
+            op.init_random_weights()
+
+    def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
+        for op in self.exec_seq:
+            op.init_tilert_vars(batch_size, seq_len)
+
+    def golden_forward(
+        self,
+        x: torch.Tensor,
+        pe_cache: torch.Tensor,
+        start_pos: int,
+    ) -> Any:
+        del x, pe_cache, start_pos
+        raise NotImplementedError("Golden forward is not implemented")
+
+    def tilert_forward(
+        self,
+        x: torch.Tensor,
+        pe_cache: torch.Tensor,
+        start_pos: int,
+    ) -> Any:
+        del x, pe_cache, start_pos
+        raise NotImplementedError("Tilert forward is not implemented")
