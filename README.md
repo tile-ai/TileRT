@@ -20,6 +20,8 @@ ______________________________________________________________________
 
 ## 📰 News
 
+- 🏭 **2026-05-22 · [TileRT in Production]**. GLM-5.1-highspeed is now live on Z.ai, powered by TileRT — from experimental prototype to real production. TileRT-v0.1.4 is coming soon.
+
 - :fire: **2026-02-14 · [Try the Online Demo](https://www.tilert.ai/)**. Our online demo is now live! Experience ultra-low-latency inference with **GLM-5** and **DeepSeek-V3.2**. [Try it now !](https://www.tilert.ai)
 
 - 🎉 **2026-02-14 · [v0.1.3](https://github.com/tile-ai/TileRT/releases/tag/v0.1.3) Released**. The v0.1.3 release introduces full support for the latest GLM-5 model, achieving up to 500 tokens/s on GLM-5-FP8 and up to 600 tokens/s on DeepSeek-V3.2.
@@ -40,20 +42,6 @@ ______________________________________________________________________
 <a id="overview"></a>
 
 **TileRT** is a project designed to serve large language models (LLMs) in ultra-low-latency scenarios. Its goal is to push the latency limits of LLMs without compromising model size or quality—enabling models with hundreds of billions of parameters to achieve millisecond-level time per output token (TPOT).
-
-In our latest **v0.1.3** release, we tested **TileRT's** performance on the newest [**GLM-5**](https://huggingface.co/zai-org/GLM-5-FP8) model, demonstrating the effectiveness of our approach in real-world applications. We were among the first to support this latest model, validating the power of the technology we've developed.
-
-Using the [**GLM-5**](https://huggingface.co/zai-org/GLM-5-FP8) model (without lossy optimizations such as quantization or distillation) with a batch size of 1 on 8× NVIDIA B200 GPUs, we evaluated TileRT’s preliminary performance. As shown in the benchmarks below, TileRT demonstrates substantial improvements over existing inference systems.
-
-<p align="center">
-<img src="assets/glm5-mtp.png" alt="TileRT Benchmark" width="800"><br>
-Figure 1. Evaluation setup. Batch size: 1; Input sequence length: 1K, 16K, 32K, 64K, 128K, 150K, 192K; Output sequence length: 1K; Benchmark with <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/bench/dataset/prepare_synthetic_data.py">synthetic data</a>. SGLang v0.5.9.dev0 with MTP=3; vLLM v0.16.0rc2.dev173 with MTP=1 (vLLM failed when MTP=3, so we set MTP=1 as <a href="https://docs.vllm.ai/projects/recipes/en/latest/GLM/GLM5.html">vLLM-GPT5-recipe</a>); TileRT v0.1.3 with MTP=3.
-</p>
-
-<p align="center">
-<img src="assets/glm5-without-mtp.png" alt="TileRT Benchmark" width="800"><br>
-Figure 2. Evaluation setup. Batch size: 1; Input sequence length: 1K, 16K, 32K, 64K, 128K, 150K, 192K; Output sequence length: 1K; Benchmark with <a href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/bench/dataset/prepare_synthetic_data.py">synthetic data</a>. SGLang v0.5.9.dev0; vLLM v0.16.0rc2.dev173; TileRT v0.1.3.
-</p>
 
 Unlike traditional inference systems optimized for high-throughput batch processing, TileRT prioritizes **responsiveness**, which is critical for applications such as high-frequency trading, interactive AI, real-time decision-making, long-running agents, and AI-assisted coding, where the latency of individual requests matters most.
 
