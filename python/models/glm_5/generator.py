@@ -183,6 +183,7 @@ class GLM5Generator:
             if not isinstance(prompt_tokens, list) and prompt_tokens.get("input_ids") is not None:
                 prompt_tokens = prompt_tokens["input_ids"]
 
+        assert prompt_tokens is not None
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
@@ -277,6 +278,7 @@ class GLM5Generator:
             if not isinstance(prompt_tokens, list) and prompt_tokens.get("input_ids") is not None:
                 prompt_tokens = prompt_tokens["input_ids"]
 
+        assert prompt_tokens is not None
         max_seq_len = self.config.max_seq_len
         prompt_len = len(prompt_tokens)
         total_len = min(max_seq_len, self.max_new_tokens + prompt_len)
