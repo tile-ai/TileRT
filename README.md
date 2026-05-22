@@ -20,7 +20,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🏭 **2026-05-22 · [TileRT in Production](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed)**. [GLM-5.1-highspeed](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed) is now live on Z.ai, powered by TileRT — from experimental prototype to real production. TileRT-v0.1.4 is coming soon.
+- 🏭 **2026-05-22 · [TileRT in Production](https://www.tilert.ai/blog/speed-as-the-next-scaling-law-zh.html)**. [GLM-5.1-highspeed](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed) is now live on Z.ai, powered by TileRT — from experimental prototype to real production. TileRT-v0.1.4 is coming soon.
 
 - :fire: **2026-02-14 · [Try the Online Demo](https://www.tilert.ai/)**. Our online demo is now live! Experience ultra-low-latency inference with **GLM-5** and **DeepSeek-V3.2**. [Try it now !](https://www.tilert.ai)
 
