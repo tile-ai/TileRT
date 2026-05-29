@@ -51,6 +51,12 @@ To achieve this, TileRT introduces a **tile-level runtime engine**. Leveraging a
 
 The project is actively evolving, and the underlying compiler techniques will be gradually shared with the community as they are integrated into **TileLang** and **TileScale**.
 
+<p align="center">
+  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5.1-FP8 token generation speed on 8× B200 with TileRT v0.1.4"/>
+  <br/>
+  <sub><em>GLM-5.1-FP8 token generation speed on 8× NVIDIA B200 with TileRT v0.1.4. Output length 1K, input length 1K–192K. Bars compare TileRT without MTP, with MTP at average acceptance length 3.2, and the peak under best-case MTP acceptance.</em></sub>
+</p>
+
 ______________________________________________________________________
 
 ## Installation
@@ -95,8 +101,12 @@ docker run --rm -it --gpus all --ipc=host \
     -v "$PWD":/workspace -w /workspace \
     ghcr.io/tile-ai/tilert:cu132-latest
 
-# Inside the container:
+# Inside the container — install from PyPI:
 pip install tilert==0.1.4
+
+# Or pin the exact wheel from the GitHub Release page directly
+# (same artifact, useful when PyPI is unreachable):
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.4/tilert-0.1.4-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
 
 Verify the install:
@@ -223,10 +233,6 @@ For example, TileRT may generate:
 This example demonstrates basic single-step autoregressive generation using the precompiled model.
 
 ### Running the Generation Example with Multi-Token Prediction (MTP)
-
-<p align="center">
-  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5 decoding throughput on TileRT with MTP"/>
-</p>
 
 TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth. Enable it from the CLI with `--with-mtp`:
 
