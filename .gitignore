@@ -38,9 +38,6 @@ MANIFEST
 *.so
 .cache/
 
-# Development mode soft link
-tilert
-
 !src/lib/
 !include/lib/
 
