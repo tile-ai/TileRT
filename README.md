@@ -224,6 +224,10 @@ This example demonstrates basic single-step autoregressive generation using the 
 
 ### Running the Generation Example with Multi-Token Prediction (MTP)
 
+<p align="center">
+  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5 decoding throughput on TileRT with MTP"/>
+</p>
+
 TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth. Enable it from the CLI with `--with-mtp`:
 
 ```bash
