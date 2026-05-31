@@ -14,7 +14,16 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch",
+    # Pinned to the exact ABI the v0.1.4 wheel was built against. ``torch`` must
+    # come from PyTorch's cu130 index (``--index-url
+    # https://download.pytorch.org/whl/cu130``); installing from PyPI yields a
+    # CUDA build that does not match the cu130-linked tilert binary.
+    "torch==2.11.0",
+    "transformers==4.46.3",
+    "tokenizers==0.20.3",
+    "numpy",
+    "scipy",
+    "einops",
 ]
 
 [project.optional-dependencies]
@@ -55,18 +64,10 @@ dev = [
 Homepage = "https://github.com/tile-ai/TileRT"
 Issues = "https://github.com/tile-ai/TileRT/issues"
 
-[build-system]
-requires = [
-    "cmake>=3.25.0",  # required by c++ 20
-    "packaging",
-    "setuptools>=64.0.0",
-    "setuptools-scm>=8.0",
-    "wheel",
-    "pytest-runner",
-    "pytest",
-    "torch"
-]
-build-backend = "setuptools.build_meta"
+# Note: this repository ships the public sources that match the v0.1.4 wheel.
+# The wheel itself is built in the development repo (TileRT-dev/TileRT) with
+# scikit-build-core; no [build-system] block is declared here on purpose so
+# nobody accidentally runs ``pip wheel .`` against this presentation copy.
 
 [tool.black]
 line-length = 100

@@ -1,3 +1,15 @@
-torch>=2.6.0
+# Runtime dependencies for the v0.1.4 wheel, pinned to the exact ABI the
+# wheel was built against. ``torch`` must be installed from PyTorch's cu130
+# index — PyPI's default ``torch`` is a different CUDA build and will not load
+# the cu130-linked tilert binary:
+#
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.11.0
+#   pip install -r requirements.txt
+#
+# The recommended path remains the prebuilt Docker image (see README).
+torch==2.11.0
+transformers==4.46.3
+tokenizers==0.20.3
 numpy
-transformers
+scipy
+einops
