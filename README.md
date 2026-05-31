@@ -20,7 +20,9 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🏭 **2026-05-22 · [TileRT in Production](https://www.tilert.ai/blog/speed-as-the-next-scaling-law-zh.html)**. [GLM-5.1-highspeed](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed) is now live on Z.ai, powered by TileRT — from experimental prototype to real production. TileRT-v0.1.4 is coming soon.
+- 🚀 **2026-06-01 · [v0.1.4](https://github.com/tile-ai/TileRT/releases/tag/v0.1.4) Released**. A major performance upgrade for both DeepSeek-V3.2 and GLM-5, with model quality unchanged.  See the benchmark charts for details.
+
+- 🏭 **2026-05-22 · [TileRT in Production](https://www.tilert.ai/blog/speed-as-the-next-scaling-law-zh.html)**. [GLM-5.1-highspeed](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed) is now live on Z.ai, powered by TileRT — from experimental prototype to real production.
 
 - :fire: **2026-02-14 · [Try the Online Demo](https://www.tilert.ai/)**. Our online demo is now live! Experience ultra-low-latency inference with **GLM-5** and **DeepSeek-V3.2**. [Try it now !](https://www.tilert.ai)
 
@@ -49,68 +51,72 @@ To achieve this, TileRT introduces a **tile-level runtime engine**. Leveraging a
 
 The project is actively evolving, and the underlying compiler techniques will be gradually shared with the community as they are integrated into **TileLang** and **TileScale**.
 
+<p align="center">
+  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5.1-FP8 token generation speed on 8× B200 with TileRT v0.1.4"/>
+  <br/>
+  <sub><em>GLM-5.1-FP8 token generation speed on 8× NVIDIA B200 with TileRT v0.1.4. Output length 1K, input length 1K–192K. Bars compare TileRT without MTP, with MTP at average acceptance length 3.2, and the peak under best-case MTP acceptance.</em></sub>
+</p>
+
 ______________________________________________________________________
 
 ## Installation
 
-- [Prerequisites](#prerequisites)
-- [Python Package Installation](#python-package-installation)
-
-### Prerequisites
-
-Before installing TileRT, ensure your environment meets the following requirements:
-
-**Hardware Requirements**
-
-- 8× NVIDIA B200 GPUs
-
-**Operating System**
-
-- Linux x86_64 (Ubuntu 20.04 or later recommended)
-
-**Python Version**
-
-- Python 3.11 – 3.12
-  *(The wheel package is built and tested against these versions.)*
-
-**PyTorch Build**
-
-- PyTorch wheels compiled for CUDA 12.8 or 12.9
-  *(Must match the CUDA driver/runtime version required for B200 GPUs.)*
-
-### Python Package Installation
-
 > \[!IMPORTANT\]
-> **Disclaimer**: TileRT is an experimental project. The current pre-built package supports the 8-GPU B200 setup. For the most reliable experience, we strongly recommend installing the package within the provided Docker image.
+> TileRT v0.1.4 is distributed as a **pre-built binary wheel**. The wheel is linked against the exact ABI of the versions listed below. Other combinations of Python, CUDA, or PyTorch versions are **untested and not guaranteed to work** — please reproduce this environment for a supported setup.
 
-The recommended installation method is using the pre-configured Docker image, which includes all necessary dependencies.
+### Build environment of the v0.1.4 wheel
 
-**Step 1: Pull the Docker image**
+The official `tilert==0.1.4` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
 
-```bash
-docker pull tileai/tilert:v0.1.0
-```
+| Component        | Pinned version                                      |
+| ---------------- | --------------------------------------------------- |
+| GPU              | 8× NVIDIA **B200**                                  |
+| NVIDIA driver    | Supports **CUDA 13.2** runtime                      |
+| Operating System | Linux **x86_64**, glibc **≥ 2.28** (manylinux_2_28) |
+| Python           | **3.12**                                            |
+| PyTorch          | **`torch==2.11.0+cu130`**                           |
+| `transformers`   | **`4.46.3`**                                        |
+| `tokenizers`     | **`0.20.3`**                                        |
 
-**Step 2: Launch a Docker container**
+### Recommended: pre-built Docker image
 
-```bash
-IMAGE_NAME="tileai/tilert:v0.1.0"
-WORKSPACE_PATH="/path/to/your/workspace"  # Replace with your actual workspace path
-
-docker run --gpus all -it \
-    -v $WORKSPACE_PATH:/workspace/ \
-    $IMAGE_NAME
-```
-
-**Step 3: Install the TileRT package**
-
-Once inside the container, install TileRT using pip:
+The pinned build environment above is preinstalled in our official image
+— this is the **recommended way to run v0.1.4** and avoids any version
+drift on the host. The image is mirrored to two registries; pull from
+whichever is reachable:
 
 ```bash
-pip install tilert
+# GitHub Container Registry
+docker pull ghcr.io/tile-ai/tilert:cu132-latest
+
+# Docker Hub
+docker pull tileai/tilert:cu132-latest
 ```
 
-You're now ready to use TileRT! Proceed to the [Getting Started](#getting-started) section to download model weights and run your first inference.
+Launch a container with all 8 B200 GPUs attached, then install the
+wheel inside:
+
+```bash
+docker run --rm -it --gpus all --ipc=host \
+    -v "$PWD":/workspace -w /workspace \
+    ghcr.io/tile-ai/tilert:cu132-latest
+
+# Inside the container — install from PyPI:
+pip install tilert==0.1.4
+
+# Or pin the exact wheel from the GitHub Release page directly
+# (same artifact, useful when PyPI is unreachable):
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.4/tilert-0.1.4-cp312-cp312-manylinux_2_28_x86_64.whl
+```
+
+Verify the install:
+
+```bash
+python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__, '/ cuda', torch.version.cuda)"
+# Expected: tilert 0.1.4 / torch 2.11.0+cu130 / cuda 13.0
+```
+
+Proceed to [Getting Started](#getting-started) to download and convert model weights.
 
 ## Getting Started
 
@@ -118,11 +124,15 @@ You're now ready to use TileRT! Proceed to the [Getting Started](#getting-starte
 
 Starting from release v0.1.3, TileRT no longer requires downloading pre-converted weights from Hugging Face. Instead, you can download the official model weights directly from the model's source (e.g., Hugging Face), and then convert them using the weight converter script included with the latest TileRT release.
 
-### Step 2: Convert Weights Using `weight_converter.py`
+### Step 2: Shard Weights with `weight_converter`
 
-After downloading the official model weights, you can use the following command to convert them into a format compatible with TileRT:
+The converter ships inside the `tilert` wheel. It rewrites the official HF
+checkpoint into TileRT's per-device layout — 8 shards, one per B200, with
+keys suffixed `*_dev_{0..7}` and a fresh `model.safetensors.index.json`.
+The runtime loads these shards directly; the original checkpoint is no
+longer needed after conversion.
 
-For **DeepSeek-V3.2**, run:
+For **DeepSeek-V3.2**:
 
 ```bash
 python -m tilert.models.preprocess.weight_converter \
@@ -131,9 +141,7 @@ python -m tilert.models.preprocess.weight_converter \
   --save_dir "/path/to/DeepSeek-V3.2-TileRT"
 ```
 
-Replace `/path/to/DeepSeek-V3.2` with the directory where you've downloaded the model weights, and `/path/to/DeepSeek-V3.2-TileRT` with the directory where you'd like the converted weights to be saved.
-
-Similarly, for **GLM-5**, run:
+For **GLM-5**:
 
 ```bash
 python -m tilert.models.preprocess.weight_converter \
@@ -142,40 +150,52 @@ python -m tilert.models.preprocess.weight_converter \
   --save_dir "/path/to/GLM-5-FP8-TileRT"
 ```
 
-Replace `/path/to/GLM-5-FP8` with the directory containing the downloaded GLM-5 model weights, and `/path/to/GLM-5-FP8-TileRT` with the desired location for saving the converted weights.
+`--model_dir` is the directory of the downloaded HF checkpoint;
+`--save_dir` is where the sharded TileRT-format weights will land.
 
-### Step 3: Set the Converted Weights Directory
+### Step 3: Register the Sharded Weights Path
 
-Once the weights are converted, set the environment variable to point TileRT to the directory containing the converted weights:
+Either pass `--model-weights-dir <path>` on every `tilert.generate`
+invocation, or register the path once in `~/.tilert/config.toml` so the
+CLI picks it up automatically:
 
-```bash
-export MODEL_WEIGHTS_DIR= ... # converted weights
+```toml
+[weights]
+deepseek_v3_2 = "/path/to/DeepSeek-V3.2-TileRT"
+glm5          = "/path/to/GLM-5-FP8-TileRT"
 ```
-
-Now you're ready to use TileRT with the converted weights!
 
 ### Running the Generation Example
 
-After downloading the model weights, you can run the generation example within the Docker environment as follows:
+The simplest entry point is the bundled CLI. Pick `--model deepseek_v3_2`
+or `--model glm5`; weights resolve from `~/.tilert/config.toml` or from
+an explicit `--model-weights-dir`:
 
 ```bash
-MODEL_WEIGHTS_DIR="/path/to/tilert_weights"
-
-docker run --gpus all -it \
-    -v $WORKSPACE_PATH:/workspace/ \
-    -v $MODEL_WEIGHTS_DIR:$MODEL_WEIGHTS_MOUNT \
-    tilert:v0.1.0
+python -m tilert.generate --model deepseek_v3_2 --max-new-tokens 1000
 ```
 
-Once inside the container, run the following Python script to perform text generation:
+> \[!NOTE\]
+> v0.1.4 ships **two independent backend libraries** (`libtilert_dsv32.so`
+> and `libtilert_glm5.so`) and loads exactly one per Python process via
+> `tilert.load_backend(model_type)`. Run DeepSeek-V3.2 and GLM-5 in
+> separate processes — they cannot coexist in a single interpreter.
+
+To drive generation programmatically, load the backend first, then build
+the matching generator:
 
 ```python
-from tilert.models.deepseek_v3_2.dsa_show_hands import ShowHandsGenerator
+import tilert
+from tilert.models.deepseek_v3_2.generator import DSAv32Generator
+from tilert.models.deepseek_v3_2.model_args import ModelArgs
 
-generator: ShowHandsGenerator = ShowHandsGenerator(
+tilert.load_backend("deepseek_v3_2")
+
+generator = DSAv32Generator(
+    model_args=ModelArgs(),
     max_new_tokens=1000,
-    model_weights_dir=MODEL_WEIGHTS_DIR,
-    with_mtp=False,  # Disable MTP
+    model_weights_dir="/path/to/DeepSeek-V3.2-TileRT",
+    with_mtp=False,
 )
 generator.from_pretrained()
 
@@ -192,6 +212,10 @@ print("Prompt:", prompt)
 print("Completion:")
 completion = generator.generate(prompt)
 ```
+
+(For **GLM-5**, swap in `tilert.load_backend("glm5")` and
+`from tilert.models.glm_5.generator import GLM5Generator` with
+`ModelArgsGLM5`.)
 
 For example, TileRT may generate:
 
@@ -210,17 +234,26 @@ This example demonstrates basic single-step autoregressive generation using the 
 
 ### Running the Generation Example with Multi-Token Prediction (MTP)
 
-TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth.
+TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth. Enable it from the CLI with `--with-mtp`:
 
-To better illustrate MTP behavior, we use a longer prompt that encourages extended generation:
+```bash
+python -m tilert.generate --model deepseek_v3_2 --with-mtp --max-new-tokens 1000
+```
+
+Or programmatically, pass `with_mtp=True` to the generator:
 
 ```python
-from tilert.models.deepseek_v3_2.dsa_show_hands import ShowHandsGenerator
+import tilert
+from tilert.models.deepseek_v3_2.generator import DSAv32Generator
+from tilert.models.deepseek_v3_2.model_args import ModelArgs
 
-generator: ShowHandsGenerator = ShowHandsGenerator(
+tilert.load_backend("deepseek_v3_2")
+
+generator = DSAv32Generator(
+    model_args=ModelArgs(),
     max_new_tokens=1000,
-    model_weights_dir=MODEL_WEIGHTS_DIR,
-    with_mtp=True,  # Enable MTP
+    model_weights_dir="/path/to/DeepSeek-V3.2-TileRT",
+    with_mtp=True,
 )
 generator.from_pretrained()
 prompt = "Tell me 10 jokes, keep them all under 100 words."
@@ -269,7 +302,7 @@ Of course! Here are 10 short jokes for you.
 
 This example highlights how MTP enables TileRT to efficiently generate longer outputs by accepting multiple tokens per decoding step, while preserving the same Python API interface.
 
-For more details, please refer to the [generation script](https://github.com/tile-ai/TileRT/blob/main/python/generate.py).
+For the full list of CLI flags (sampling, batching, benchmark modes, …), run `python -m tilert.generate --help`.
 
 ## Status & Future Work
 
