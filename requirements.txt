@@ -1,4 +1,4 @@
-# Runtime dependencies for the v0.1.4 wheel, pinned to the exact ABI the
+# Runtime dependencies for the v0.1.5 wheel, pinned to the exact ABI the
 # wheel was built against. ``torch`` must be installed from PyTorch's cu130
 # index — PyPI's default ``torch`` is a different CUDA build and will not load
 # the cu130-linked tilert binary:

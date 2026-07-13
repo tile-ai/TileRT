@@ -20,18 +20,20 @@ ______________________________________________________________________
 
 ## 📰 News
 
+- 🔀 **2026-07-13 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce **PD (prefill–decode) disaggregation** — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5 and DeepSeek-V3.2.
+
 - 💥 **2026-06-08 · [Breaking 1000 TPS on a 1T Model](https://www.tilert.ai/blog/breaking-1000-tps.html)**. In collaboration with [Xiaomi MiMo](https://mimo.xiaomi.com/blog/mimo-tilert-1000tps), TileRT pushes [**MiMo-V2.5-Pro-UltraSpeed**](https://platform.xiaomimimo.com/docs/en-US/model-intro/mimo-v2.5-pro-ultraspeed) past **1000 tokens/s** on a **1-trillion-parameter** model through extreme model–system co-design — a first without custom silicon, all on a single 8-GPU node.
 
 - 🚀 **2026-06-01 · [v0.1.4](https://github.com/tile-ai/TileRT/releases/tag/v0.1.4) Released**. A major performance upgrade for both DeepSeek-V3.2 and GLM-5, with model quality unchanged.  See the benchmark charts for details.
 
 - 🏭 **2026-05-22 · [TileRT in Production](https://www.tilert.ai/blog/speed-as-the-next-scaling-law-zh.html)**. [**GLM-5.1-highspeed**](https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1-highspeed) is now live on Z.ai, powered by TileRT — from experimental prototype to real production.
 
+<details>
+  <summary>Key Milestones</summary>
+
 - :fire: **2026-02-14 · [Try the Online Demo](https://www.tilert.ai/)**. Our online demo is now live! Experience ultra-low-latency inference with **GLM-5** and **DeepSeek-V3.2**. [Try it now !](https://www.tilert.ai)
 
 - 🎉 **2026-02-14 · [v0.1.3](https://github.com/tile-ai/TileRT/releases/tag/v0.1.3) Released**. The v0.1.3 release introduces full support for the latest GLM-5 model, achieving up to 500 tokens/s on GLM-5-FP8 and up to 600 tokens/s on DeepSeek-V3.2.
-
-<details>
-  <summary>Key Milestones</summary>
 
 - 🚀 **2026-01-26 · [v0.1.2-alpha.1](https://github.com/tile-ai/TileRT/releases/tag/v0.1.2-alpha.1)**. **Multi-Token Prediction (MTP)** is now available in TileRT! With mtp=3, we achieve decoding rates of up to **590 tokens/s** under synthetic workloads.
 
@@ -54,9 +56,9 @@ To achieve this, TileRT introduces a **tile-level runtime engine**. Leveraging a
 The project is actively evolving, and the underlying compiler techniques will be gradually shared with the community as they are integrated into **TileLang** and **TileScale**.
 
 <p align="center">
-  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5.1-FP8 token generation speed on 8× B200 with TileRT v0.1.4"/>
+  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5.1-FP8 token generation speed on 8× B200 with TileRT v0.1.5"/>
   <br/>
-  <sub><em>GLM-5.1-FP8 token generation speed on 8× NVIDIA B200 with TileRT v0.1.4. Output length 1K, input length 1K–192K. Bars compare TileRT without MTP, with MTP at average acceptance length 3.2, and the peak under best-case MTP acceptance.</em></sub>
+  <sub><em>GLM-5.1-FP8 token generation speed on 8× NVIDIA B200 with TileRT v0.1.5. Output length 1K, input length 1K–192K. Bars compare TileRT without MTP, with MTP at average acceptance length 3.2, and the peak under best-case MTP acceptance (4.0).</em></sub>
 </p>
 
 ______________________________________________________________________
@@ -64,11 +66,11 @@ ______________________________________________________________________
 ## Installation
 
 > \[!IMPORTANT\]
-> TileRT v0.1.4 is distributed as a **pre-built binary wheel**. The wheel is linked against the exact ABI of the versions listed below. Other combinations of Python, CUDA, or PyTorch versions are **untested and not guaranteed to work** — please reproduce this environment for a supported setup.
+> TileRT v0.1.5 is distributed as a **pre-built binary wheel**. The wheel is linked against the exact ABI of the versions listed below. Other combinations of Python, CUDA, or PyTorch versions are **untested and not guaranteed to work** — please reproduce this environment for a supported setup.
 
-### Build environment of the v0.1.4 wheel
+### Build environment of the v0.1.5 wheel
 
-The official `tilert==0.1.4` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
+The official `tilert==0.1.5` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
 
 | Component        | Pinned version                                      |
 | ---------------- | --------------------------------------------------- |
@@ -83,7 +85,7 @@ The official `tilert==0.1.4` wheel on PyPI was compiled against the following st
 ### Recommended: pre-built Docker image
 
 The pinned build environment above is preinstalled in our official image
-— this is the **recommended way to run v0.1.4** and avoids any version
+— this is the **recommended way to run v0.1.5** and avoids any version
 drift on the host. The image is mirrored to two registries; pull from
 whichever is reachable:
 
@@ -104,18 +106,18 @@ docker run --rm -it --gpus all --ipc=host \
     ghcr.io/tile-ai/tilert:cu132-latest
 
 # Inside the container — install from PyPI:
-pip install tilert==0.1.4
+pip install tilert==0.1.5
 
 # Or pin the exact wheel from the GitHub Release page directly
 # (same artifact, useful when PyPI is unreachable):
-pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.4/tilert-0.1.4-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5/tilert-0.1.5-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
 
 Verify the install:
 
 ```bash
 python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__, '/ cuda', torch.version.cuda)"
-# Expected: tilert 0.1.4 / torch 2.11.0+cu130 / cuda 13.0
+# Expected: tilert 0.1.5 / torch 2.11.0+cu130 / cuda 13.0
 ```
 
 Proceed to [Getting Started](#getting-started) to download and convert model weights.
@@ -178,7 +180,7 @@ python -m tilert.generate --model deepseek_v3_2 --max-new-tokens 1000
 ```
 
 > \[!NOTE\]
-> v0.1.4 ships **two independent backend libraries** (`libtilert_dsv32.so`
+> v0.1.5 ships **two independent backend libraries** (`libtilert_dsv32.so`
 > and `libtilert_glm5.so`) and loads exactly one per Python process via
 > `tilert.load_backend(model_type)`. Run DeepSeek-V3.2 and GLM-5 in
 > separate processes — they cannot coexist in a single interpreter.
@@ -305,6 +307,110 @@ Of course! Here are 10 short jokes for you.
 This example highlights how MTP enables TileRT to efficiently generate longer outputs by accepting multiple tokens per decoding step, while preserving the same Python API interface.
 
 For the full list of CLI flags (sampling, batching, benchmark modes, …), run `python -m tilert.generate --help`.
+
+## Disaggregated Serving: vLLM Prefill + TileRT Decode
+
+TileRT can run as the **decode engine behind a vLLM prefill**, integrated through vLLM's V1 `KVConnector` interface. The connector, decode server, and router all ship inside the `tilert` wheel under `tilert.pd_vllm` — no vLLM fork or patch is needed (the connector loads via vLLM's standard `kv_connector_module_path`). Latency-critical requests are routed to the TileRT decode pool; other traffic can stay on native vLLM decode.
+
+**Prerequisites**
+
+- Convert the model weights for TileRT decode (see [Step 2](#step-2-shard-weights-with-weight_converter)).
+- On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5 / DeepSeek-V3.2 (DSA) model and the `fp8_ds_mla` KV-cache dtype. Install `tilert` in the same environment so the connector plugin is importable.
+- **The KV-cache dtype must match on both ends.** These examples use fp8: `--kv-cache-dtype fp8_ds_mla` on the vLLM prefill and `--kv-cache-dtype fp8` on the TileRT decode (a mismatch is rejected at the connector handshake).
+- The examples use the **NIXL** transfer engine. On multi-NIC hosts, pin NIXL to the RDMA NICs via `UCX_NET_DEVICES` (otherwise UCX may pick the wrong interface). Mooncake is also supported (`--transport mooncake` on the decode, `"tilert_transport": "mooncake"` on the prefill).
+
+Commands below use GLM-5. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`.
+
+### Topology A: vLLM prefill → TileRT decode
+
+Three processes — a TileRT decode server, a stock vLLM prefill, and an OpenAI-compatible router:
+
+```bash
+# 1) TileRT decode node
+python -m tilert.pd_vllm.decode_server \
+    --engine tilert --model glm5 \
+    --model-weights-dir /path/to/GLM-5-FP8-TileRT \
+    --with-mtp --max-seq-len 202752 \
+    --kv-cache-dtype fp8 --transport nixl \
+    --ctrl-port 5556 --http-port 5557
+
+# 2) vLLM prefill (stock vLLM; the TileRT connector loads as a plugin).
+#    The MTP speculative config is required: the prefill populates the
+#    draft-layer KV that decode-side speculation resumes from.
+export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...   # pin NIXL to the RDMA NICs (multi-NIC hosts)
+vllm serve /path/to/GLM-5-FP8 \
+    --served-model-name glm5 --port 8000 \
+    --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
+    --return-tokens-as-token-ids --gpu-memory-utilization 0.85 \
+    --kv-cache-dtype fp8_ds_mla \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
+    --kv-transfer-config '{
+        "kv_connector": "TileRTConnector",
+        "kv_connector_module_path": "tilert.pd_vllm.prefill_connector",
+        "kv_role": "kv_producer",
+        "kv_connector_extra_config": {
+            "tilert_host": "<TILERT_DECODE_IP>", "tilert_ctrl_port": 5556,
+            "tilert_model": "glm5", "tilert_max_seq_len": 202752,
+            "tilert_transport": "nixl"}}'
+
+# 3) Router — OpenAI-compatible ingress for the TileRT pool
+python -m tilert.pd_vllm.pd_router \
+    --vllm-url http://<PREFILL_IP>:8000 \
+    --decode <TILERT_DECODE_IP>:5556:5557 \
+    --model-path /path/to/GLM-5-FP8 \
+    --parser glm47 --port 23333
+```
+
+Send OpenAI requests to `http://<router>:23333/v1/chat/completions`. The router runs the prefill on vLLM (first token), hands the attention state to the TileRT decode node over RDMA, and streams the completion back.
+
+### Topology B: shared prefill → TileRT decode **and** native vLLM decode
+
+One prefill pool feeds two decode pools side by side, composed under vLLM's `MultiConnector`. Each request is claimed by exactly one connector — the TileRT connector claims requests marked with `tilert_host`, and vLLM's native connector handles the rest — so latency-critical traffic goes to TileRT while general traffic stays on native vLLM decode, behind the same OpenAI surface.
+
+```bash
+# 1) TileRT decode node (identical to Topology A)
+python -m tilert.pd_vllm.decode_server --engine tilert --model glm5 \
+    --model-weights-dir /path/to/GLM-5-FP8-TileRT --with-mtp \
+    --max-seq-len 202752 --kv-cache-dtype fp8 --transport nixl \
+    --ctrl-port 5556 --http-port 5557
+
+# 2) Native vLLM decode node — vLLM's standard disaggregation (NixlConnector consumer)
+export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...
+vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8001 \
+    --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
+    --return-tokens-as-token-ids --kv-cache-dtype fp8_ds_mla \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
+    --kv-transfer-config '{"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}'
+
+# 3) Shared vLLM prefill — MultiConnector[ NixlConnector + TileRTConnector ]
+export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...
+vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8000 \
+    --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
+    --return-tokens-as-token-ids --gpu-memory-utilization 0.85 \
+    --kv-cache-dtype fp8_ds_mla \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
+    --kv-transfer-config '{
+        "kv_connector": "MultiConnector", "kv_role": "kv_producer",
+        "kv_connector_extra_config": {"connectors": [
+            {"kv_connector": "NixlConnector", "kv_role": "kv_producer"},
+            {"kv_connector": "TileRTConnector",
+             "kv_connector_module_path": "tilert.pd_vllm.prefill_connector",
+             "kv_role": "kv_producer",
+             "kv_connector_extra_config": {
+                 "tilert_host": "<TILERT_DECODE_IP>", "tilert_ctrl_port": 5556,
+                 "tilert_model": "glm5", "tilert_max_seq_len": 202752,
+                 "tilert_transport": "nixl"}}]}}'
+
+# 4a) TileRT router — latency-critical traffic → TileRT pool
+python -m tilert.pd_vllm.pd_router --vllm-url http://<PREFILL_IP>:8000 \
+    --decode <TILERT_DECODE_IP>:5556:5557 --model-path /path/to/GLM-5-FP8 \
+    --parser glm47 --port 23333
+
+# 4b) General traffic → native vLLM decode pool, via vLLM's standard NixlConnector
+#     disaggregation proxy, pointing prefill :8000 → native decode :8001.
+```
+
+**Note.** Running NIXL end to end (both the native and TileRT connectors in NIXL mode) lets the shared prefill use a single transfer library. Only the prefill's `--kv-transfer-config` differs from Topology A; the TileRT decode node is unchanged, and the native decode instance plus its proxy follow vLLM's usual `NixlConnector` disaggregation setup.
 
 ## Status & Future Work
 
