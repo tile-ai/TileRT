@@ -6,7 +6,7 @@ description = "TileRT"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-authors = [{name = "TileRT Team", email = "contact@tilert.ai"}]
+authors = [{name = "TileRT-team", email = "contact@tilert.ai"}]
 classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
