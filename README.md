@@ -341,7 +341,7 @@ export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...   # pin NIXL to the RDMA NICs (mult
 vllm serve /path/to/GLM-5-FP8 \
     --served-model-name glm5 --port 8000 \
     --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
-    --return-tokens-as-token-ids --gpu-memory-utilization 0.85 \
+    --return-tokens-as-token-ids --gpu-memory-utilization 0.75 \
     --kv-cache-dtype fp8_ds_mla \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
     --kv-transfer-config '{
@@ -386,7 +386,7 @@ vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8001 \
 export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...
 vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8000 \
     --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
-    --return-tokens-as-token-ids --gpu-memory-utilization 0.85 \
+    --return-tokens-as-token-ids --gpu-memory-utilization 0.75 \
     --kv-cache-dtype fp8_ds_mla \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
     --kv-transfer-config '{
