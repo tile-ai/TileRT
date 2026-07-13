@@ -18,7 +18,6 @@ __all__ = [
 ]
 
 
-VALID_SEQ_LENS = (1, 2, 4)
 
 
 def expert_down_allreduce(
@@ -30,25 +29,11 @@ def expert_down_allreduce(
     x_in: torch.Tensor,
     flag: int,
     vec_out: torch.Tensor,
-    profile_logs: torch.Tensor,
     model_arch: str,
     compute_kernel_type: str = "bf16",
+    profile_logs: torch.Tensor | None = None,
 ) -> None:
-    """
-    Fused expert down + allreduce (unified for DSv32 and GLM5).
-
-    Args:
-        vec_in: [1, seq_len, n_experts, 256], bfloat16.
-        mat_in: [n_experts, dim, 256], float8_e4m3fn.
-        mat_scale: [n_experts, 1024, 2], bfloat16 (DSv32) or float32 (GLM5).
-        indices: [1, seq_len, 8], int32.
-        scores: [1, seq_len, 8], float32.
-        x_in: [1, seq_len, dim], bfloat16.
-        flag: User flag.
-        vec_out: [1, seq_len, dim], bfloat16 (output).
-        profile_logs: 1D tensor for profile logs.
-        compute_kernel_type: "bf16".
-    """
+    """Fused expert down + allreduce (unified for DSv32 and GLM5)."""
     torch.ops.tilert.expert_down_allreduce_op(
         vec_in,
         mat_in,
@@ -58,16 +43,20 @@ def expert_down_allreduce(
         x_in,
         flag,
         vec_out,
-        profile_logs,
         model_arch,
         compute_kernel_type,
+        profile_logs,
     )
+
+
 
 
 class ExpertDownAllReduceAlgorithm(Enum):
     """ExpertDownAllReduce algorithm."""
 
     GENERAL = "general"
+    BF16MMA = "bf16mma"
+    GLM5_FP4_HMMA = "glm5_fp4_hmma"
 
 
 class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
@@ -86,6 +75,26 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
         assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
         pre_shape = mat_in.shape[:-2]
         return mat_in.reshape(*pre_shape, 8, 2, 4, 4).transpose(-2, -3).contiguous()
+
+    @staticmethod
+    def _swizzle_bf16mma_full_16x32(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
+        assert mat_in.dtype == torch.float8_e4m3fn
+        pre = mat_in.shape[:-2]
+        mat = mat_in.reshape(*pre, 2, 8, 2, 2, 4, 2)
+        n = len(pre)
+        mat = mat.permute(*range(n), 1 + n, 4 + n, 2 + n, 3 + n, 0 + n, 5 + n)
+        return mat.reshape(*pre, 32, 16).contiguous()
+
+    @staticmethod
+    def _swizzle_bf16mma_partial_8x32(mat_in: torch.Tensor) -> torch.Tensor:
+        assert mat_in.shape[-2] == 8 and mat_in.shape[-1] == 32
+        assert mat_in.dtype == torch.float8_e4m3fn
+        pre = mat_in.shape[:-2]
+        mat = mat_in.reshape(*pre, 8, 2, 2, 4, 2)
+        n = len(pre)
+        mat = mat.permute(*range(n), 0 + n, 3 + n, 1 + n, 2 + n, 4 + n)
+        return mat.reshape(*pre, 32, 8).contiguous()
 
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
@@ -155,16 +164,135 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
                 mat_scale_tilert = mat_scale_tilert.to(torch.bfloat16)
             return mat_in_swizzled.contiguous(), mat_scale_tilert.contiguous()
 
+    def convert_to_bf16mma(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        args = self.model_args
+        assert args.arch_name in (
+            "deepseek_v3_2",
+            "glm_5",
+        ), "BF16 MMA wired for DSv32 / GLM5 only."
+        dim = args.dim
+        num_sms = 128
+        dim_per_sm = dim // num_sms
+        expert_dim = args.moe_inter_dim // 8
+        k_chunks = expert_dim // 32
+        scale_cols = expert_dim // args.block_size
+        n_full_tiles = dim_per_sm // 16
+        remainder_rows = dim_per_sm % 16
+        full_rows = n_full_tiles * 16
+
+        with torch.inference_mode():
+            mat_in, scale_in = weights_list
+            exp_num = mat_in.shape[0]
+            mat_per_cta = mat_in.reshape(exp_num, num_sms, dim_per_sm, expert_dim)
+
+            full_part = mat_per_cta[:, :, :full_rows, :]
+            full_tiles = full_part.reshape(
+                exp_num, num_sms, n_full_tiles, 16, k_chunks, 32
+            ).transpose(3, 4)
+            full_swizzled = self._swizzle_bf16mma_full_16x32(full_tiles)
+            full_swizzled = full_swizzled.reshape(
+                exp_num, num_sms, n_full_tiles * k_chunks * 32 * 16
+            )
+
+            mats = [full_swizzled]
+            if remainder_rows > 0:
+                partial_part = mat_per_cta[:, :, full_rows:, :]
+                partial_tiles = partial_part.reshape(
+                    exp_num, num_sms, 1, remainder_rows, k_chunks, 32
+                ).transpose(3, 4)
+                partial_swizzled = self._swizzle_bf16mma_partial_8x32(partial_tiles)
+                partial_swizzled = partial_swizzled.reshape(
+                    exp_num, num_sms, k_chunks * 32 * remainder_rows
+                )
+                mats.append(partial_swizzled)
+
+            mat_swizzled = torch.cat(mats, dim=2) if len(mats) > 1 else mats[0]
+            mat_swizzled = mat_swizzled.reshape(exp_num, dim, expert_dim)
+
+            mat_scale_tilert = (
+                scale_in.reshape(exp_num, dim // args.block_size, 1, scale_cols)
+                .repeat(1, 1, 16, 1)
+                .reshape(exp_num, num_sms, -1)
+            )
+            target_cols_per_sm = 1024 * scale_cols // num_sms
+            pad_amount = target_cols_per_sm - mat_scale_tilert.shape[-1]
+            if pad_amount > 0:
+                padding_zeros = torch.zeros(
+                    (exp_num, num_sms, pad_amount),
+                    dtype=scale_in.dtype,
+                    device=scale_in.device,
+                )
+                mat_scale_tilert = torch.cat([mat_scale_tilert, padding_zeros], dim=2)
+            mat_scale_tilert = mat_scale_tilert.reshape(exp_num, 1024, scale_cols)
+            if args.arch_name == "glm_5":
+                mat_scale_tilert = mat_scale_tilert.to(torch.float32)
+            else:
+                mat_scale_tilert = mat_scale_tilert.to(torch.bfloat16)
+
+            return mat_swizzled.contiguous(), mat_scale_tilert.contiguous()
+
+    def convert_to_glm5_fp4_hmma(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from tilert.models.common_mxfp4 import (
+            _unpack_fp4_nibbles_last,
+            build_down_weights_mma_natural,
+        )
+
+        assert (
+            len(weights_list) == 2
+        ), f"convert_to_glm5_fp4_hmma expects 2 tensors, got {len(weights_list)}"
+        down_fp4, down_e8m0 = weights_list
+        arch = self.model_args.arch_name
+        assert arch == "glm_5", f"GLM5_FP4_HMMA down converter is GLM5-only, got arch={arch}"
+
+        dim = self.model_args.dim
+        moe_inter_pd = self.model_args.moe_inter_dim // self.num_devices
+
+        with torch.inference_mode():
+            if down_fp4.shape[-1] == moe_inter_pd:
+                down_nib = down_fp4.to(torch.uint8).contiguous()
+            else:
+                assert down_fp4.shape[-1] == moe_inter_pd // 2, (
+                    "routed fp4 down last dim must be inter_pd or inter_pd/2; "
+                    f"got {down_fp4.shape[-1]} (inter_pd={moe_inter_pd})"
+                )
+                down_nib = _unpack_fp4_nibbles_last(down_fp4)
+            down_e8 = down_e8m0.to(torch.uint8).contiguous()
+
+            n_routed = down_nib.shape[0]
+            assert down_nib.shape == (n_routed, dim, moe_inter_pd), (
+                f"down_fp4 must be (n_routed, {dim}, {moe_inter_pd}); "
+                f"got {tuple(down_nib.shape)}"
+            )
+
+            device = down_nib.device
+            e_total = n_routed + 1
+            u8 = {"dtype": torch.uint8, "device": device}
+            full_nib = torch.zeros(e_total, dim, moe_inter_pd, **u8)
+            full_e8 = torch.zeros(e_total, dim, moe_inter_pd // 32, **u8)
+            full_nib[1:] = down_nib
+            full_e8[1:] = down_e8
+            down_packed = build_down_weights_mma_natural(full_nib, full_e8, dim, moe_inter_pd)
+            dummy = torch.zeros(1, dtype=torch.float32, device=device)
+            return down_packed, dummy
+
+
+
 
 @dataclass
 class ExpertDownAllReduceTilertWeightsAlias:
-    """TileRT weights alias for ExpertDownAllReduce."""
 
     exp_down_weights = "exp_down_weights"
     exp_down_scales = "exp_down_scales"
 
     @property
     def tilert_tensor_alias(self) -> list[str]:
+        return [self.exp_down_weights, self.exp_down_scales]
+
+    def glm5_fp4_tilert_tensor_alias(self) -> list[str]:
         return [self.exp_down_weights, self.exp_down_scales]
 
     def __call__(self) -> list[str]:
@@ -175,8 +303,15 @@ class ExpertDownAllReduce(TileRTModule):
     """ExpertDownAllReduce module."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [ExpertDownAllReduceAlgorithm.GENERAL],
-        "glm_5": [ExpertDownAllReduceAlgorithm.GENERAL],
+        "deepseek_v3_2": [
+            ExpertDownAllReduceAlgorithm.GENERAL,
+            ExpertDownAllReduceAlgorithm.BF16MMA,
+        ],
+        "glm_5": [
+            ExpertDownAllReduceAlgorithm.GENERAL,
+            ExpertDownAllReduceAlgorithm.BF16MMA,
+            ExpertDownAllReduceAlgorithm.GLM5_FP4_HMMA,
+        ],
     }
 
     def __init__(
@@ -210,6 +345,8 @@ class ExpertDownAllReduce(TileRTModule):
 
         if self.arch_name in ("deepseek_v3_2", "glm_5"):
             self.compute_kernel_type = "bf16"
+            if algorithm == ExpertDownAllReduceAlgorithm.BF16MMA:
+                self.compute_kernel_type = "bf16mma"
         else:
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
 
@@ -227,6 +364,13 @@ class ExpertDownAllReduce(TileRTModule):
     @property
     def tilert_tensor_alias(self) -> list[str]:
         return self.tilert_weights_alias.tilert_tensor_alias
+
+    def set_algorithm(self, algorithm: Enum) -> None:
+        super().set_algorithm(algorithm)
+        if algorithm == ExpertDownAllReduceAlgorithm.BF16MMA:
+            self.compute_kernel_type = "bf16mma"
+        elif algorithm == ExpertDownAllReduceAlgorithm.GENERAL:
+            self.compute_kernel_type = "bf16"
 
     def get_weights_list(self) -> list[torch.Tensor]:
         return [self.tilert_weights, self.tilert_scales]
@@ -261,11 +405,50 @@ class ExpertDownAllReduce(TileRTModule):
         )
         return down_proj_weight, down_proj_scale
 
+    @staticmethod
+    def _split_last_axis(t: torch.Tensor, num_devices: int) -> torch.Tensor:
+        d, inter = t.shape[-2], t.shape[-1]
+        assert (
+            inter % num_devices == 0
+        ), f"down last-axis {inter} not divisible by num_devices {num_devices}"
+        return (
+            t.reshape(d, num_devices, inter // num_devices)
+            .transpose(0, 1)
+            .reshape(num_devices, 1, d, inter // num_devices)
+        )
+
+    def process_down_weights_fp4(
+        self,
+        key_prefix: str,
+        weights_hf: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        n_dev = self.num_devices
+        down_w = weights_hf[f"{key_prefix}.down_proj.weight"]
+        down_s = weights_hf[f"{key_prefix}.down_proj.weight_scale"]
+        return self._split_last_axis(down_w, n_dev), self._split_last_axis(down_s, n_dev)
+
+    def device_sharding_fp4(
+        self,
+        weights_dict: dict[str, torch.Tensor],
+        key_prefix: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shard routed-only down weight + scale across devices."""
+        dw, ds = [], []
+        for exp_id in range(self.n_routed_experts):
+            down_weights, down_scales = self.process_down_weights_fp4(
+                f"{key_prefix}.experts.{exp_id}", weights_dict
+            )
+            dw.append(down_weights)
+            ds.append(down_scales)
+        return torch.cat(dw, dim=1).contiguous(), torch.cat(ds, dim=1).contiguous()
+
     def device_sharding(
         self,
         weights_dict: dict[str, torch.Tensor],
         key_prefix: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.algorithm == ExpertDownAllReduceAlgorithm.GLM5_FP4_HMMA:
+            return self.device_sharding_fp4(weights_dict, key_prefix)
         assert self.n_shared_experts == 1, "Only one shared expert is supported"
         down_weights_list = []
         down_scales_list = []
@@ -300,13 +483,31 @@ class ExpertDownAllReduce(TileRTModule):
             weight_dequant(down_weight, down_scale)
             for down_weight, down_scale in zip(down_weights, down_scales)
         ]
-        self.ref_down = torch.stack(down_list, dim=0)
+        self.ref_down = torch.stack([t.to(torch.bfloat16) for t in down_list], dim=0)
+
+    def get_tilert_weights_alias(self) -> list[str]:
+        """Return the alias list keyed into ``state_dict`` for this op."""
+        return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         assert self.algorithm is not None, "Algorithm is not set"
-        self.tilert_weights, self.tilert_scales = ExpertDownAllReduceWeightsConverter(
-            self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        if self.algorithm == ExpertDownAllReduceAlgorithm.GLM5_FP4_HMMA:
+            assert (
+                self.arch_name == "glm_5"
+            ), f"GLM5_FP4_HMMA is GLM5-only, got arch={self.arch_name}"
+            converter = ExpertDownAllReduceWeightsConverter(self.model_args, self.num_devices)
+            self.tilert_weights, self.tilert_scales = converter.convert_to_glm5_fp4_hmma(
+                [state_dict[alias] for alias in self.tensor_alias]
+            )
+            self.is_tilert_weights_init = True
+            return
+        aliases = [state_dict[alias] for alias in self.tensor_alias]
+        self.tilert_weights, self.tilert_scales = (
+            torch.ops.tilert.expert_down_allreduce__convert_weights(
+                aliases, self.model_arch, self.compute_kernel_type
+            )
+        )
+        self.is_tilert_weights_init = True
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
         self.hidden_out = torch.zeros(
@@ -317,7 +518,9 @@ class ExpertDownAllReduce(TileRTModule):
         self.profile_logs = get_profile_log_tensor(device=f"cuda:{device_id}")
         self.is_init = True
 
-    def init_random_weights(self, device_id: int = 0) -> None:
+    def init_random_weights(self, device_id: int | None = None) -> None:
+        if device_id is None:
+            device_id = self.device_id
         n = self.n_routed_experts + 1
         dev = f"cuda:{device_id}"
         down_weights = list(
@@ -389,9 +592,9 @@ class ExpertDownAllReduce(TileRTModule):
             x_in,
             flag,
             self.hidden_out,
-            self.profile_logs,
             self.model_arch,
             self.compute_kernel_type,
+            self.profile_logs,
         )
         return self.hidden_out
 

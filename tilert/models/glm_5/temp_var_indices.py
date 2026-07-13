@@ -1,13 +1,4 @@
-"""Named indices for DSA temporary variables.
-
-Lets Python code reference temp_vars by name instead of magic numbers.
-
-Usage::
-
-    from tilert.models.glm_5._dsa_v32.temp_var_indices import Idx
-
-    token_out = intermediates[Idx.TOKEN_OUT]  # equivalent to intermediates[25]
-"""
+"""Named indices for DSA temporary variables."""
 
 from enum import IntEnum
 
@@ -26,7 +17,7 @@ class DsaTempVarIdx(IntEnum):
     IDX_LOGITS = 8
     IDX_SELECTS = 9
     Q_NOPE = 10
-    O = 11  # noqa: E741
+    O = 11  # noqa: E741 — mirrors C++ DsaTempVars::O
     O_ACC = 12
     O_LSE = 13
     O_LSE_ACC = 14
@@ -71,24 +62,19 @@ class DsaTempVarIdx(IntEnum):
     TOP_N_LOG_PROBS = 53
     TOP_N_INDICES = 54
     LOGPROBS_FLAG = 55
+    AR_ACCEPTED_TOKENS = 56
+    AR_NUM_ACCEPTED = 57
+    HIDDEN_MID = 58
+    GRAMMAR_BITMASK = 59
 
 
-TEMP_VARS_SIZE = 56
+TEMP_VARS_SIZE = 60
 
 Idx = DsaTempVarIdx
 
 
 def validate_temp_vars_layout() -> None:
-    """Validate the temporary-variable index enum.
-
-    Checks:
-    1. Enum member count equals TEMP_VARS_SIZE.
-    2. Indices are contiguous 0..TEMP_VARS_SIZE-1 with no gaps or duplicates.
-    3. (If the backend is loaded) the backend temp_vars_size matches TEMP_VARS_SIZE.
-
-    Raises:
-        RuntimeError: If any validation check fails.
-    """
+    """Validate the temporary-variable index enum."""
     members = list(DsaTempVarIdx)
 
     if len(members) != TEMP_VARS_SIZE:
@@ -112,7 +98,8 @@ def validate_temp_vars_layout() -> None:
         cpp_size = torch.ops.tilert.dsa_temp_vars_size()
         if cpp_size != TEMP_VARS_SIZE:
             raise RuntimeError(
-                f"TEMP_VARS_SIZE={TEMP_VARS_SIZE} != " f"backend temp_vars_size={cpp_size}"
+                f"Python TEMP_VARS_SIZE={TEMP_VARS_SIZE} != "
+                f"C++ DsaTempVars::temp_vars_size={cpp_size}"
             )
     except (AttributeError, RuntimeError):
         pass

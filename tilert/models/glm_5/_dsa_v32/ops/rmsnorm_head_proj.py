@@ -26,7 +26,6 @@ def rmsnorm_head_proj(
     model_arch: str,
     compute_kernel_type: str = "general",
 ) -> None:
-    """RMS Norm Head Projection operation."""
     torch.ops.tilert.rmsnorm_head_proj_op(
         hidden_in,
         gamma_in,
@@ -60,20 +59,18 @@ class RMSNormHeadProjWeightsConverter(TilertWeightsConverter):
     def convert_to_general(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert the weights to general format.
-
-        Args:
-            weights_list: List of weights.
-
-        Returns:
-            Tuple of weights.
-        """
         args = self.model_args
         assert args.arch_name == "deepseek_v3_2" or args.arch_name == "glm_5"
 
         with torch.inference_mode():
             rmsnorm_gamma, mat_in = weights_list
+            if args.arch_name == "glm_5":
+                from tilert.models.glm_5._dsa_v32.ops.head_proj_w16a16_hmma import (
+                    swizzle_head_proj_weight_bf16mma,
+                )
+
+                weights = swizzle_head_proj_weight_bf16mma(mat_in.contiguous())
+                return rmsnorm_gamma.float(), weights
             logits_dim = mat_in.shape[-2]
             dim = mat_in.shape[-1]
             num_steps = dim // 1024
@@ -150,27 +147,13 @@ class RMSNormHeadProj(TileRTModule):
         return self.tilert_weights_alias()
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """
-        Get the weights list.
-
-        Returns:
-            List of weights.
-        """
+        """Get the weights list."""
         return [self.tilert_rmsnorm_gamma, self.tilert_head_proj]
 
     def device_sharding(
         self,
         weights_dict: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Device sharding.
-
-        Args:
-            weights_dict: Dictionary of weights.
-            key_prefix: Key prefix.
-        Returns:
-            Tuple of weights.
-        """
         rmsnorm_gamma_key = "model.norm.weight"
         head_proj_key = "lm_head.weight"
         rmsnorm_gamma = weights_dict[rmsnorm_gamma_key][None, ...]
@@ -181,13 +164,6 @@ class RMSNormHeadProj(TileRTModule):
         return rmsnorm_gamma.contiguous(), head_proj.contiguous()
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize the reference weights.
-
-        Args:
-            state_dict: State dictionary.
-            device_id: Device ID.
-        """
         sharded_list = self.device_sharding(state_dict)
 
         gamma, head_proj = sharded_list[0][self.device_id], sharded_list[1][self.device_id]
@@ -195,25 +171,12 @@ class RMSNormHeadProj(TileRTModule):
         self.ref_head_proj = head_proj
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize the tilert weights.
-
-        Args:
-            state_dict: State dictionary.
-        """
         assert self.algorithm is not None
         self.tilert_rmsnorm_gamma, self.tilert_head_proj = RMSNormHeadProjWeightsConverter(
             self.model_args, self.num_devices
         ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tilert_weights_alias()])
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
-        """
-        Initialize the tilert variables.
-
-        Args:
-            batch_size: Batch size.
-            seq_len: Sequence length.
-        """
         self.hidden_rmsnorm_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -227,8 +190,9 @@ class RMSNormHeadProj(TileRTModule):
         self.profile_logs = get_profile_log_tensor(device=f"cuda:{self.device_id}")
         self.is_init = True
 
-    def init_random_weights(self, device_id: int = 0) -> None:
-        """Initialize the random weights."""
+    def init_random_weights(self, device_id: int | None = None) -> None:
+        if device_id is None:
+            device_id = self.device_id
         rmsnorm_gamma = torch.randn(self.dim, dtype=torch.float32, device=f"cuda:{device_id}")
         head_proj = torch.randn(
             self.logits_dim, self.dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"
@@ -252,15 +216,6 @@ class RMSNormHeadProj(TileRTModule):
         self,
         hidden_in: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass for the down-project module.
-
-        Args:
-            hidden_in: Input hidden.
-
-        Returns:
-            Output tensor.
-        """
         assert self.ref_rmsnorm_gamma is not None
         assert self.ref_head_proj is not None
         bsz = hidden_in.shape[0]

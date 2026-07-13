@@ -31,23 +31,6 @@ def layernorm_rope_rotate(
     model_arch: str,
     compute_kernel_type: str = "general",
 ) -> None:
-    """
-    Layernorm_rope_rotate operation.
-
-    Layernorm_rope_rotate the input tensor `input_raw` and stores the result in `k_cache_raw`.
-
-    Args:
-        input_raw (torch.Tensor): The input tensor.
-        cur_pos (torch.Tensor): The current position tensor.
-        k_cache_raw (torch.Tensor): The output tensor where the result will be stored.
-        weight (torch.Tensor): The weight tensor.
-        bias (torch.Tensor): The bias tensor.
-        freqs_cis (torch.Tensor): The frequency tensor.
-        profile_logs (torch.Tensor): Tensor for storing profiling logs.
-
-    Returns:
-        None
-    """
     if input_raw.dtype != torch.bfloat16:
         raise ValueError("input must be a bfloat16 tensor.")
     if cur_pos.dtype != torch.int32:
@@ -162,15 +145,6 @@ class LayerNormRoPERotate(TileRTModule):
         return [self.tilert_weight, self.tilert_bias]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding: replicate weight and bias for each device.
-
-        Args:
-            weights_map: Map from ref weight alias to tensor.
-
-        Returns:
-            Map from tilert weight alias to (num_devices, ...) tensors.
-        """
         k_weight = weights_map[self.ref_weights_alias.k_weight][None, ...].repeat(
             self.num_devices, 1
         )
@@ -215,7 +189,7 @@ class LayerNormRoPERotate(TileRTModule):
         k_pe, k_nope = torch.split(
             k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis).squeeze(2)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, interleaved=False).squeeze(2)
         k = torch.cat([k_pe, k_nope], dim=-1)
         return rotate_activation(k)
 

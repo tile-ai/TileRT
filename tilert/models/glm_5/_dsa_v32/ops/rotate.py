@@ -65,21 +65,12 @@ def rotate(
     profile_logs: torch.Tensor,
     model_arch: str,
     compute_kernel_type: str = "general",
+    kv_cache: torch.Tensor | None = None,
+    cur_pos: torch.Tensor | None = None,
+    cache_base: int = 0,
+    cache_stride: int = 0,
+    cache_compressed: bool = False,
 ) -> None:
-    """
-    Rotate (hadamard transform) operation.
-
-    Args:
-        input_raw (torch.Tensor): The input tensor [..., head, 128].
-        output_raw (torch.Tensor): The output tensor where the result will be stored.
-        freqs_cis_raw (torch.Tensor): The frequency tensor.
-        profile_logs (torch.Tensor): Tensor for storing profiling logs.
-        model_arch: Model architecture string.
-        compute_kernel_type: Compute kernel type string.
-
-    Returns:
-        None
-    """
     torch.ops.tilert.rotate_op(
         input_raw,
         output_raw,
@@ -87,6 +78,11 @@ def rotate(
         model_arch,
         compute_kernel_type,
         profile_logs,
+        kv_cache,
+        cur_pos,
+        cache_base,
+        cache_stride,
+        cache_compressed,
     )
 
 
@@ -121,11 +117,7 @@ class RotateAlgorithm(Enum):
 
 
 class Rotate(TileRTModule):
-    """Rotate module: RoPE on first qk_rope_head_dim dims + hadamard transform.
-
-    Unified for deepseek_v3_2 (index_n_heads=64) and glm_5 (index_n_heads=32).
-    No weights; uses model_args for dimensions.
-    """
+    """Rotate module: RoPE on first qk_rope_head_dim dims + hadamard transform."""
 
     _SUPPORTED_ALGORITHMS = {
         "deepseek_v3_2": [RotateAlgorithm.GENERAL],
@@ -193,7 +185,7 @@ class Rotate(TileRTModule):
             [self.qk_rope_head_dim, self.index_head_dim - self.qk_rope_head_dim],
             dim=-1,
         )
-        q_pe_idx = apply_rotary_emb(q_pe_idx, freqs_cis)
+        q_pe_idx = apply_rotary_emb(q_pe_idx, freqs_cis, interleaved=False)
         idx_q = torch.cat([q_pe_idx, q_nope_idx], dim=-1)
         return rotate_activation(idx_q)
 

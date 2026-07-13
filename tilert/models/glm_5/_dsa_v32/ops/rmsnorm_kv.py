@@ -26,18 +26,6 @@ def rmsnorm_kv(
     model_arch: str,
     compute_kernel_type: str = "general",
 ) -> None:
-    """
-    Define the RMSNormKV operation.
-
-    Args:
-        kv: Input tensor.
-        gamma: Weight tensor.
-        cur_pos: Current position tensor.
-        kv_cache: Output tensor.
-        profile_logs: Profile logs tensor.
-        model_arch: Model architecture string.
-        compute_kernel_type: Compute kernel type string.
-    """
     torch.ops.tilert.rmsnorm_kv_op(
         kv, gamma, cur_pos, kv_cache, model_arch, compute_kernel_type, profile_logs
     )
@@ -75,14 +63,15 @@ class KVRMSNormAlgorithm(Enum):
     """KVRMSNorm algorithm."""
 
     GENERAL = "general"
+    FP8 = "fp8"
 
 
 class KVRMSNorm(TileRTModule):
     """KVRMSNorm module: RMSNorm on KV tensor with in-place write to kv_cache."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [KVRMSNormAlgorithm.GENERAL],
-        "glm_5": [KVRMSNormAlgorithm.GENERAL],
+        "deepseek_v3_2": [KVRMSNormAlgorithm.GENERAL, KVRMSNormAlgorithm.FP8],
+        "glm_5": [KVRMSNormAlgorithm.GENERAL, KVRMSNormAlgorithm.FP8],
     }
 
     def __init__(
@@ -126,40 +115,27 @@ class KVRMSNorm(TileRTModule):
         return [self.tilert_kv_norm_weight]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding: replicate gamma for each device.
-
-        Args:
-            weights_map: Map from ref weight alias to tensor.
-
-        Returns:
-            Map from tilert weight alias to (num_devices, ...) tensors.
-        """
         gamma = weights_map[self.ref_weights_alias.kv_norm_weight][None, ...].repeat(
             self.num_devices, 1
         )
         return {self.tilert_weights_alias.kv_norm_gamma: gamma}
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize reference weights from state dict."""
         self.ref_norm_gamma = state_dict[self.ref_weights_alias.kv_norm_weight].contiguous()
         assert (
             self.ref_norm_gamma.shape[-1] == self.kv_lora_rank
         ), f"kv_norm weight shape must be ({self.kv_lora_rank},), got {self.ref_norm_gamma.shape}"
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize TileRT weights from state dict."""
         gamma = state_dict[self.tilert_weights_alias.kv_norm_gamma]
         self.tilert_kv_norm_weight = gamma.float().detach().clone().contiguous()
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
-        """Allocate TileRT profiling buffer."""
         del batch_size, seq_len
         self.profile_logs = get_profile_log_tensor()
         self.is_var_init = True
 
     def init_random_weights(self) -> None:
-        """Initialize random reference and TileRT weights for testing."""
         ref_state_dict = {
             self.ref_weights_alias.kv_norm_weight: torch.randn(
                 self.kv_lora_rank, dtype=torch.float32
@@ -172,13 +148,16 @@ class KVRMSNorm(TileRTModule):
     def golden_forward(
         self, kv: torch.Tensor, kv_cache: torch.Tensor, start_pos: int, bsz: int, seqlen: int
     ) -> None:
-        """Reference forward: RMSNorm and write to kv_cache."""
         assert self.ref_norm_gamma is not None
         end_pos = start_pos + seqlen
         out = torch.nn.functional.rms_norm(
             kv.float(), [kv.size(-1)], self.ref_norm_gamma, self.eps
         ).to(kv.dtype)
         kv_cache[:bsz, start_pos:end_pos].copy_(out)
+
+    @property
+    def is_fp8(self) -> bool:
+        return self.algorithm == KVRMSNormAlgorithm.FP8
 
     def tilert_forward(
         self, kv: torch.Tensor, kv_cache: torch.Tensor, start_pos: int, bsz: int, seqlen: int
@@ -194,6 +173,7 @@ class KVRMSNorm(TileRTModule):
             kv_cache[:bsz],
             self.profile_logs,
             model_arch=self.model_args.arch_name,
+            compute_kernel_type="fp8" if self.is_fp8 else "general",
         )
 
     def __call__(

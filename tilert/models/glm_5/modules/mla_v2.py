@@ -1,4 +1,4 @@
-"""MLA weight generator classes for device-group-specific pipelines."""
+"""V2 MLA weight generator classes for device-group-specific pipelines."""
 
 import torch
 
@@ -19,6 +19,7 @@ from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projq_wqi import (
 )
 from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqakis import (
     RMSNormProjxWqakis,
+    RMSNormProjxWqakisAlgorithm,
 )
 from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
     RMSNormProjxWqkva,
@@ -31,6 +32,8 @@ from tilert.models.glm_5._dsa_v32.ops.unproj_o_allreduce import (
 
 
 class SparseSelectMlaV2(SerializableTileRTModule):
+    """Device Group A (GPU 0): sparse selector MLA."""
+
     def __init__(
         self,
         model_args: ModelArgs,
@@ -44,12 +47,13 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         self.rmsnorm_projx_wqakis = RMSNormProjxWqakis(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
+        self.rmsnorm_projx_wqakis.algorithm = RMSNormProjxWqakisAlgorithm.W8A16HMMA
         self.register_op(self.rmsnorm_projx_wqakis)
 
         self.rmsnorm_projq_wqi = RmsnormProjqWqi(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
-        self.rmsnorm_projq_wqi.algorithm = RmsnormProjqWqiAlgorithm.FP16MMA
+        self.rmsnorm_projq_wqi.algorithm = RmsnormProjqWqiAlgorithm.BF16MMA
         self.register_op(self.rmsnorm_projq_wqi)
 
         self.layernorm_rope_rotate = LayerNormRoPERotate(
@@ -58,7 +62,10 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         self.register_op(self.layernorm_rope_rotate)
 
         self.projx_wis = ProjxWis(
-            model_args=model_args, device_id=device_id, num_devices=num_devices
+            model_args=model_args,
+            device_id=device_id,
+            num_devices=num_devices,
+            compute_kernel_type="bf16mma",
         )
         self.register_op(self.projx_wis)
 
@@ -70,7 +77,7 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         self.pe_cache: torch.Tensor | None = None
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """Return weight tensors."""
+        """Return weight tensors in registration order."""
         weights = super().get_weights_list()
 
         dev = f"cuda:{self.device_id}"
@@ -79,7 +86,7 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         if self.partial_buf is None:
             self.partial_buf = torch.zeros(
                 self.model_args.max_batch_size,
-                4,
+                8,
                 self.model_args.dim,
                 dtype=torch.bfloat16,
                 device=dev,
@@ -91,49 +98,51 @@ class SparseSelectMlaV2(SerializableTileRTModule):
         return weights
 
     def get_cache_vars(self) -> list[torch.Tensor]:
-        """Return [ki_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
+        """Return [k_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
-        bs_args = (self.model_args.max_batch_size, cache_seq_len)
+        bs = self.model_args.max_batch_size
+        dev = f"cuda:{self.device_id}"
 
         if self.ki_cache is None:
             ki_dim = self.model_args.index_head_dim
-            self.ki_cache = torch.zeros(
-                *bs_args, ki_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            self.ki_cache = torch.zeros(bs, cache_seq_len, ki_dim, dtype=torch.bfloat16, device=dev)
         if self.kv_cache is None:
             kv_dim = self.model_args.kv_lora_rank
-            self.kv_cache = torch.zeros(
-                *bs_args, kv_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            if getattr(self.model_args, "fp8_kv_cache", False):
+                self.kv_cache = torch.zeros(
+                    bs, 1, kv_dim + (kv_dim // 128) * 4, dtype=torch.uint8, device=dev
+                )
+            else:
+                self.kv_cache = torch.zeros(bs, 1, kv_dim, dtype=torch.bfloat16, device=dev)
         if self.pe_cache is None:
-            pe_dim = self.model_args.qk_rope_head_dim
             self.pe_cache = torch.zeros(
-                *bs_args, pe_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
+                bs, 1, self.model_args.qk_rope_head_dim, dtype=torch.bfloat16, device=dev
             )
         return [*super().get_cache_vars(), self.ki_cache, self.kv_cache, self.pe_cache]
 
 
 class PureMlaV2(SerializableTileRTModule):
+    """Device Group B (GPU 1-7): pure MLA."""
 
     def __init__(
         self,
         model_args: ModelArgs,
         device_id: int,
         num_devices: int,
-        ll_buf: torch.Tensor | None = None,
+        recv_buf: torch.Tensor | None = None,
     ):
         super().__init__(model_args=model_args, device_id=device_id, num_devices=num_devices)
 
         self.rmsnorm_projx_wqkva = RMSNormProjxWqkva(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
-        self.rmsnorm_projx_wqkva.algorithm = RMSNormProjxWqkvaAlgorithm.DECOUPLED
+        self.rmsnorm_projx_wqkva.algorithm = RMSNormProjxWqkvaAlgorithm.W8A16HMMA
         self.register_op(self.rmsnorm_projx_wqkva)
 
         self.rmsnorm_projq_wqb = RmsnormProjqWqb(
             model_args=model_args, device_id=device_id, num_devices=num_devices
         )
-        self.rmsnorm_projq_wqb.algorithm = RmsnormProjqWqbAlgorithm.FP16MMA
+        self.rmsnorm_projq_wqb.algorithm = RmsnormProjqWqbAlgorithm.BF16MMA
         self.register_op(self.rmsnorm_projq_wqb)
 
         self.rmsnorm_kv = KVRMSNorm(
@@ -151,7 +160,7 @@ class PureMlaV2(SerializableTileRTModule):
         )
         self.register_op(self.projo_wkvb)
 
-        allreduce_algo = UnProjOAllReduceAlgorithm.FP16MMA
+        allreduce_algo = UnProjOAllReduceAlgorithm.BF16MMA
         self.unproj_o_allreduce = UnProjOAllReduce(
             model_args=model_args,
             device_id=device_id,
@@ -160,14 +169,14 @@ class PureMlaV2(SerializableTileRTModule):
         )
         self.register_op(self.unproj_o_allreduce)
 
-        self.ll_buf = ll_buf
+        self.recv_buf = recv_buf
 
         self.ki_cache: torch.Tensor | None = None
         self.kv_cache: torch.Tensor | None = None
         self.pe_cache: torch.Tensor | None = None
 
     def init_random_weights(self) -> None:
-        """Initialize random weights for this module."""
+        """Override to re-init ProjQWkvb/ProjOWkvb with HMMA-packed weights."""
         super().init_random_weights()
 
         from tilert.models.common import init_func
@@ -193,7 +202,7 @@ class PureMlaV2(SerializableTileRTModule):
             op.init_tilert_weights_hmma(per_dev)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Load TileRT weights for this module from state_dict."""
+        """Override to use HMMA-packed weights for ProjQWkvb and ProjOWkvb."""
         self.projq_wqb.is_tilert_weights_init = True
         self.projo_wkvb.is_tilert_weights_init = True
 
@@ -211,38 +220,47 @@ class PureMlaV2(SerializableTileRTModule):
             op.init_tilert_weights_hmma(op_state_dict)
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """Return weight tensors."""
+        """Return weight tensors in registration order."""
         weights = super().get_weights_list()
 
-        if self.ll_buf is None:
-            max_seq_len = getattr(self.model_args, "num_mtp", 3) + 1
+        if self.recv_buf is None:
+            max_seq_len = max(getattr(self.model_args, "num_mtp", 3) + 1, 8)
             topk = self.model_args.index_topk
-            self.ll_buf = torch.zeros(
+            self.recv_buf = torch.zeros(
                 max_seq_len * topk * 2, dtype=torch.int32, device=f"cuda:{self.device_id}"
             )
 
-        weights.append(self.ll_buf)
+        weights.append(self.recv_buf)
 
         return weights
 
     def get_cache_vars(self) -> list[torch.Tensor]:
-        """Return [ki_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
+        """Return [k_cache, kv_cache, pe_cache] matching DsaCacheVars layout."""
         cache_seq_len = self.model_args.max_seq_len + self.model_args.kv_cache_pad
-        bs_args = (self.model_args.max_batch_size, cache_seq_len)
+        bs = self.model_args.max_batch_size
+        dev = f"cuda:{self.device_id}"
 
         if self.ki_cache is None:
-            ki_dim = self.model_args.index_head_dim
             self.ki_cache = torch.zeros(
-                *bs_args, ki_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
+                bs, 1, self.model_args.index_head_dim, dtype=torch.bfloat16, device=dev
             )
         if self.kv_cache is None:
             kv_dim = self.model_args.kv_lora_rank
-            self.kv_cache = torch.zeros(
-                *bs_args, kv_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
-            )
+            if getattr(self.model_args, "fp8_kv_cache", False):
+                kv_merged = kv_dim + (kv_dim // 128) * 4
+                self.kv_cache = torch.zeros(
+                    bs, cache_seq_len, kv_merged, dtype=torch.uint8, device=dev
+                )
+            else:
+                self.kv_cache = torch.zeros(
+                    bs, cache_seq_len, kv_dim, dtype=torch.bfloat16, device=dev
+                )
         if self.pe_cache is None:
-            pe_dim = self.model_args.qk_rope_head_dim
             self.pe_cache = torch.zeros(
-                *bs_args, pe_dim, dtype=torch.bfloat16, device=f"cuda:{self.device_id}"
+                bs,
+                cache_seq_len,
+                self.model_args.qk_rope_head_dim,
+                dtype=torch.bfloat16,
+                device=dev,
             )
         return [*super().get_cache_vars(), self.ki_cache, self.kv_cache, self.pe_cache]

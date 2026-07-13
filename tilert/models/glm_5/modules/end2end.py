@@ -9,14 +9,13 @@ from typing import Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file
 
 from tilert import logger
 from tilert.models.base import TileRTModule
 from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
-from tilert.models.glm_5._dsa_v32.modules.dsa import Dsa
-from tilert.models.glm_5._dsa_v32.modules.mtp import MTP
-from tilert.models.glm_5._dsa_v32.temp_var_indices import Idx, validate_temp_vars_layout
+from tilert.models.glm_5.modules.dsa import Dsa
+from tilert.models.glm_5.modules.mtp import MTP
+from tilert.models.glm_5.temp_var_indices import Idx, validate_temp_vars_layout
 from tilert.models.utils import precompute_freqs_cis
 from tilert.utils import get_profile_log_tensor
 
@@ -24,6 +23,32 @@ __all__ = ["ShowHandsDSALayer", "_extract_ffn_ops", "_get_moe_weight_keys"]
 
 
 DeviceResult = tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor]
+
+
+def _load_state_dicts_by_index(
+    model_path: str,
+    weight_file_map: dict[str, str],
+    weights_list: list[str],
+    device: str,
+    selective_only: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Load tensors treating the index (``weight_file_map``) as the per-key authority."""
+    target_files = {weight_file_map[key] for key in weights_list}
+    weights_set = set(weights_list)
+    state_dicts: dict[str, torch.Tensor] = {}
+    for weight_file in sorted(target_files):
+        filepath = os.path.join(model_path, weight_file)
+        logger.info(f"Loading weights from {weight_file} to {device}")
+        with safe_open(filepath, framework="pt", device=device) as f:
+            for key in f.keys():
+                if selective_only and key not in weights_set:
+                    continue
+                if weight_file_map.get(key, weight_file) != weight_file:
+                    continue
+                state_dicts[key] = f.get_tensor(key)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return state_dicts
 
 
 def _mark_weights_initialized(module: TileRTModule) -> None:
@@ -35,12 +60,9 @@ def _mark_weights_initialized(module: TileRTModule) -> None:
 
 
 def _extract_ffn_ops(dsa: "Dsa") -> list:
-    """Extract Moe/Mlp op objects from a Dsa's layer blocks.
-
-    Returns a list of length n_layers where each element is a Moe or Mlp instance.
-    """
-    from tilert.models.glm_5._dsa_v32.modules.mlp import MlpBlock
-    from tilert.models.glm_5._dsa_v32.modules.moe import MoeBlock
+    """Extract Moe/Mlp op objects from a Dsa's layer blocks."""
+    from tilert.models.glm_5.modules.mlp import MlpBlock
+    from tilert.models.glm_5.modules.moe import MoeBlock
 
     ffn_ops = []
     for block in dsa.exec_seq:
@@ -61,8 +83,8 @@ def _extract_ffn_ops(dsa: "Dsa") -> list:
 
 def _get_moe_weight_keys(dsa: "Dsa") -> set[str]:
     """Get state_dict keys that belong exclusively to MOE/MLP ops in this Dsa."""
-    from tilert.models.glm_5._dsa_v32.modules.mlp import MlpBlock
-    from tilert.models.glm_5._dsa_v32.modules.moe import MoeBlock
+    from tilert.models.glm_5.modules.mlp import MlpBlock
+    from tilert.models.glm_5.modules.moe import MoeBlock
 
     moe_keys: set[str] = set()
     mla_keys: set[str] = set()
@@ -76,6 +98,11 @@ def _get_moe_weight_keys(dsa: "Dsa") -> set[str]:
     return moe_keys - mla_keys
 
 
+def _glm5_suffix(is_glm5: "bool | str" = True) -> str:  # noqa: U100
+    """GLM5-native tree: the torch.ops name suffix is always ``_glm5``."""
+    return "_glm5"
+
+
 def dsa_show_hands_prepare_money(
     params: list[torch.Tensor],
     temp_vars: list[torch.Tensor],
@@ -83,11 +110,11 @@ def dsa_show_hands_prepare_money(
     profile_logs: torch.Tensor,
     forward_max_seq_len: int,
     with_mtp: bool = False,
-    is_glm5: bool = False,
+    is_glm5: "bool | str" = False,
 ) -> Any:
     """Prepare money for show hands"""
     mtp_flag = "_mtp_e2e" if with_mtp else ""
-    glm5_flag = "_glm5" if is_glm5 else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_prepare_money{glm5_flag}"
     if mtp_flag:
         return getattr(torch.ops.tilert, func_name)(params, temp_vars, cache_vars, profile_logs)
@@ -96,69 +123,87 @@ def dsa_show_hands_prepare_money(
     )
 
 
-def dsa_show_hands(token_id: torch.Tensor, with_mtp: bool = False, is_glm5: bool = False) -> Any:
-    """Show hands with native MT"""
+def dsa_show_hands(
+    token_id: torch.Tensor,
+    with_mtp: bool = False,
+    is_glm5: "bool | str" = False,
+    ar_steps: int = 1,
+) -> Any:
+    """Show hands with native MT."""
     mtp_flag = "_mtp_e2e" if with_mtp else ""
-    glm5_flag = "_glm5" if is_glm5 else ""
-    func_name = f"dsa{mtp_flag}_show_hands{glm5_flag}"
-    return getattr(torch.ops.tilert, func_name)(token_id)
+    glm5_flag = _glm5_suffix(is_glm5)
+    op = getattr(torch.ops.tilert, f"dsa{mtp_flag}_show_hands{glm5_flag}")
+    if is_glm5:
+        return op(token_id, int(ar_steps))
+    return op(token_id)
 
 
-def dsa_show_hands_reset(with_mtp: bool = False, is_glm5: bool = False) -> Any:
+def dsa_show_hands_accepted_tokens(dev: int, is_glm5: "bool | str" = True) -> torch.Tensor:
+    """Read w/o-MTP AR accepted-tokens flat buffer ([0]=count, [1:]=token stream)."""
+    glm5_flag = _glm5_suffix(is_glm5)
+    return getattr(torch.ops.tilert, f"dsa_show_hands_accepted_tokens{glm5_flag}")(dev)
+
+
+def dsa_show_hands_num_accepted(dev: int, is_glm5: "bool | str" = True) -> torch.Tensor:
+    """Read w/o-MTP AR per-step num_accepted flat buffer ([0]=steps, [1:]=counts)."""
+    glm5_flag = _glm5_suffix(is_glm5)
+    return getattr(torch.ops.tilert, f"dsa_show_hands_num_accepted{glm5_flag}")(dev)
+
+
+def dsa_mtp_e2e_accepted_tokens(dev: int, is_glm5: "bool | str" = True) -> torch.Tensor:
+    """Read the AR accepted-tokens flat buffer ([0]=count, [1:]=token stream)."""
+    glm5_flag = _glm5_suffix(is_glm5)
+    return getattr(torch.ops.tilert, f"dsa_mtp_e2e_accepted_tokens{glm5_flag}")(dev)
+
+
+def dsa_mtp_e2e_num_accepted(dev: int, is_glm5: "bool | str" = True) -> torch.Tensor:
+    """Read the AR per-step num_accepted flat buffer ([0]=steps, [1:]=counts)."""
+    glm5_flag = _glm5_suffix(is_glm5)
+    return getattr(torch.ops.tilert, f"dsa_mtp_e2e_num_accepted{glm5_flag}")(dev)
+
+
+def dsa_show_hands_reset(with_mtp: bool = False, is_glm5: "bool | str" = False) -> Any:
     """Reset show one hand"""
     mtp_flag = "_mtp_e2e" if with_mtp else ""
-    glm5_flag = "_glm5" if is_glm5 else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_reset{glm5_flag}"
     return getattr(torch.ops.tilert, func_name)()
 
 
-def dsa_show_hands_go_home(with_mtp: bool = False, is_glm5: bool = False) -> Any:
+def dsa_show_hands_go_home(with_mtp: bool = False, is_glm5: "bool | str" = False) -> Any:
     """Go home"""
     mtp_flag = "_mtp_e2e" if with_mtp else ""
-    glm5_flag = "_glm5" if is_glm5 else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_go_home{glm5_flag}"
     return getattr(torch.ops.tilert, func_name)()
 
 
 def dsa_show_hands_set_sampling_seed(
-    seed: int, with_mtp: bool = False, is_glm5: bool = False
+    seed: int, with_mtp: bool = False, is_glm5: "bool | str" = False
 ) -> Any:
-    """Set the sampling seed (request-level, fixed for the entire request).
-
-    Args:
-        seed: The sampling seed value.
-    """
+    """Set the sampling seed (request-level, fixed for the entire request)."""
     mtp_flag = "_mtp_e2e" if with_mtp else ""
-    glm5_flag = "_glm5" if is_glm5 else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_set_sampling_seed{glm5_flag}"
     return getattr(torch.ops.tilert, func_name)(seed)
 
 
 def dsa_mtp_e2e_show_hands_set_prefill_valid_tokens(
-    num_valid_tokens: int, is_glm5: bool = False
+    num_valid_tokens: int, is_glm5: "bool | str" = False, with_mtp: bool = True
 ) -> Any:
-    """Set the number of valid (non-padding) tokens for prefill mode.
-
-    This controls how many tokens are copied from draft_tokens to predicted_tokens
-    during prefill. Should be called before forward() when the chunk has padding.
-
-    Args:
-        num_valid_tokens: Number of valid tokens in the chunk (1-4).
-    """
-    mtp_flag = "_mtp_e2e"
-    glm5_flag = "_glm5" if is_glm5 else ""
+    """Select prefill (num_valid_tokens > 0) vs decode (0) mode."""
+    mtp_flag = "_mtp_e2e" if with_mtp else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_set_prefill_valid_tokens{glm5_flag}"
     return getattr(torch.ops.tilert, func_name)(num_valid_tokens)
 
 
-def dsa_mtp_e2e_show_hands_set_prefill_mtp_extra_token(token: int, is_glm5: bool = False) -> Any:
-    """Set the extra token for MTP[0] shifted input during prefill.
-
-    Args:
-        token: The extra prompt token id (int32).
-    """
+def dsa_mtp_e2e_show_hands_set_prefill_mtp_extra_token(
+    token: int, is_glm5: "bool | str" = False
+) -> Any:
+    """Set the extra token for MTP[0] shifted input during prefill."""
     mtp_flag = "_mtp_e2e"
-    glm5_flag = "_glm5" if is_glm5 else ""
+    glm5_flag = _glm5_suffix(is_glm5)
     func_name = f"dsa{mtp_flag}_show_hands_set_prefill_mtp_extra_token{glm5_flag}"
     return getattr(torch.ops.tilert, func_name)(token)
 
@@ -176,17 +221,23 @@ class ShowHandsDSALayer:
         top_p: float = 0.9,
         top_k: int = 256,
         use_topp: bool = False,
+        num_mtp: int = 3,
     ) -> None:
         validate_temp_vars_layout()
         print(f"Model args: {model_args.arch_name}")
         for k_arg, v_arg in model_args.__dict__.items():
             print(f" - {k_arg}: {v_arg}")
         self.model_args = model_args
-        self.is_glm5 = self.model_args.arch_name == "glm_5"
-        assert self.model_args.arch_name in ["deepseek_v3_2", "glm_5"]
+        arch = self.model_args.arch_name
+        assert (
+            arch == "glm_5"
+        ), f"glm_5-native ShowHandsDSALayer requires arch_name 'glm_5', got {arch!r}"
+        self.is_glm5: bool = True
 
         self.num_devices = 8
-        self.forward_max_seq_len = 4
+        assert num_mtp == 3, "num_mtp must be 3"
+        self.num_mtp = num_mtp
+        self.forward_max_seq_len = num_mtp + 1
 
         self.model_path = model_path
         self.with_weight_conversion = with_weight_conversion
@@ -222,30 +273,13 @@ class ShowHandsDSALayer:
         if skip_keys:
             weights_list = [k for k in weights_list if k not in skip_keys]
 
-        target_files = set()
-        for weight_key in weights_list:
-            weight_file = weight_file_map[weight_key]
-            target_files.add(weight_file)
-
-        state_dicts = {}
-        weights_set = set(weights_list)
-        for weight_file in target_files:
-            filepath = os.path.join(model_path, weight_file)
-            if skip_keys:
-                logger.info(
-                    f"Selectively loading weights from {weight_file} for device {device_id}"
-                )
-                with safe_open(filepath, framework="pt", device=f"cuda:{device_id}") as f:
-                    for key in f.keys():
-                        if key in weights_set:
-                            state_dicts[key] = f.get_tensor(key)
-                torch.cuda.empty_cache()
-            else:
-                logger.info(f"Loading weights from {weight_file} for device {device_id}")
-                state_dict = load_file(filepath, device=f"cuda:{device_id}")
-                state_dicts.update(state_dict)
-                del state_dict
-                torch.cuda.empty_cache()
+        state_dicts = _load_state_dicts_by_index(
+            model_path,
+            weight_file_map,
+            weights_list,
+            device=f"cuda:{device_id}",
+            selective_only=bool(skip_keys),
+        )
 
         state_dicts["freqs_cis"] = self._gen_freqs_cis().to(device_id)
         return state_dicts
@@ -339,16 +373,7 @@ class ShowHandsDSALayer:
         cached_ffn_ops_per_device: dict[int, list] | None = None,
         skip_keys_per_device: dict[int, set[str]] | None = None,
     ) -> None:
-        """Load the model weights from the given path or generate random weights.
-
-        Args:
-            model_path: Path to the model weights directory.
-            cached_ffn_ops_per_device: Optional dict mapping device_id to cached FFN ops.
-                When provided, these ops are injected into the Dsa and their weights
-                are not re-loaded from disk.
-            skip_keys_per_device: Optional dict mapping device_id to safetensors keys
-                to skip during loading. Used together with cached_ffn_ops_per_device.
-        """
+        """Load the model weights from the given path or generate random weights."""
         self._v2_p2p: dict = {}
 
         def __load_weights(device_id: int, model_path: str | None) -> None:
@@ -389,6 +414,7 @@ class ShowHandsDSALayer:
                 dsa.init_tilert_weights(state_dicts)
                 self._dsa_objects[device_id] = dsa
                 params.extend(dsa.get_weights_list())
+                torch.cuda.empty_cache()
                 caches.extend(dsa.get_cache_vars())
 
                 if device_id == 0:
@@ -397,7 +423,7 @@ class ShowHandsDSALayer:
                     }
                 else:
                     self._v2_p2p[device_id] = {
-                        "ll_buf": dsa.v2_ll_buf,
+                        "recv_buf": dsa.v2_recv_buf,
                     }
                 intermediates.extend(
                     self.generate_params_with_continuous_storage(
@@ -428,12 +454,13 @@ class ShowHandsDSALayer:
                         device=device_id,
                     )
                 )
+                intermediates[Idx.GRAMMAR_BITMASK].fill_(-1)
 
                 base_params_count = len(params)
                 base_caches_count = len(caches)
 
                 if self.with_mtp:
-                    from tilert.models.glm_5._dsa_v32.modules.mla_v2 import (
+                    from tilert.models.glm_5.modules.mla_v2 import (
                         PureMlaV2,
                         SparseSelectMlaV2,
                     )
@@ -446,7 +473,7 @@ class ShowHandsDSALayer:
                             "peer_bufs": dsa.v2_peer_bufs,
                         }
                     else:
-                        mtp_kwargs["mla_kwargs"] = {"ll_buf": dsa.v2_ll_buf}
+                        mtp_kwargs["mla_kwargs"] = {"recv_buf": dsa.v2_recv_buf}
                     mtp = MTP(self.model_args, device_id, self.num_devices, **mtp_kwargs)
                     mtp.init_tilert_weights(state_dicts)
                     params.extend(mtp.get_weights_list())
@@ -493,10 +520,10 @@ class ShowHandsDSALayer:
             peer_bufs_cpu = torch.zeros(self.num_devices - 1, dtype=torch.int64)
             for i in range(self.num_devices - 1):
                 dev_id = i + 1
-                peer_bufs_cpu[i] = self._v2_p2p[dev_id]["ll_buf"].data_ptr()
+                peer_bufs_cpu[i] = self._v2_p2p[dev_id]["recv_buf"].data_ptr()
             gpu0["peer_bufs"].copy_(peer_bufs_cpu)
             logger.info(
-                "V2 P2P exchange complete: peer_bufs (ll_buf)=%s",
+                "V2 P2P exchange complete: peer_bufs (recv_buf)=%s",
                 [hex(int(x)) for x in peer_bufs_cpu],
             )
 
@@ -554,18 +581,35 @@ class ShowHandsDSALayer:
         with_mtp: bool | None = None,
     ) -> list[DeviceResult]:
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
-        dsa_show_hands(token_id.cpu(), active_mtp, self.is_glm5)
+        dsa_show_hands(token_id.cpu(), active_mtp, self.is_glm5, ar_steps=1)
         return [self._get_device_result(device_id) for device_id in range(self.num_devices)]
 
+    def show_hands(self, prev_draft_tokens: torch.Tensor, ar_steps: int = 1) -> None:
+        """MTP decode (GLM5, unified-style single op)."""
+        dsa_show_hands(prev_draft_tokens.cpu(), True, self.is_glm5, ar_steps)
+
+    def ar_accepted_tokens(self, dev: int = 0) -> torch.Tensor:
+        """AR accepted-tokens flat buffer ([0]=count, [1:]=token stream)."""
+        return dsa_mtp_e2e_accepted_tokens(dev, self.is_glm5)
+
+    def ar_num_accepted(self, dev: int = 0) -> torch.Tensor:
+        """AR per-step num_accepted flat buffer ([0]=steps, [1:]=per-step counts)."""
+        return dsa_mtp_e2e_num_accepted(dev, self.is_glm5)
+
+    def show_hands_no_mtp(self, prev_token: torch.Tensor, ar_steps: int = 1) -> None:
+        """w/o-MTP decode (GLM5, unified-style single op)."""
+        dsa_show_hands(prev_token.cpu(), False, self.is_glm5, ar_steps)
+
+    def ar_accepted_tokens_no_mtp(self, dev: int = 0) -> torch.Tensor:
+        """w/o-MTP AR accepted-tokens flat buffer ([0]=count, [1:]=token stream)."""
+        return dsa_show_hands_accepted_tokens(dev, self.is_glm5)
+
+    def ar_num_accepted_no_mtp(self, dev: int = 0) -> torch.Tensor:
+        """w/o-MTP AR per-step num_accepted flat buffer ([0]=steps, [1:]=counts)."""
+        return dsa_show_hands_num_accepted(dev, self.is_glm5)
+
     def set_sampling_seed(self, seed: int, with_mtp: bool | None = None) -> None:
-        """Set the sampling seed for top-p sampling.
-
-        The seed is fixed for the entire request. Position provides per-step variation.
-
-        Args:
-            seed: The sampling seed value.
-            with_mtp: Override MTP mode for this call. Defaults to self.with_mtp.
-        """
+        """Set the sampling seed for top-p sampling."""
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         dsa_show_hands_set_sampling_seed(seed, active_mtp, self.is_glm5)
 
@@ -595,84 +639,37 @@ class ShowHandsDSALayer:
             raise RuntimeError(f"Device {device_id} is not initialized")
         return device_result
 
-    def set_prefill_valid_tokens(self, num_valid_tokens: int) -> None:
-        """Set the number of valid tokens for prefill mode.
-
-        This controls how many tokens are copied from draft_tokens to predicted_tokens
-        during prefill. Should be called before forward() when the chunk has padding.
-
-        Args:
-            num_valid_tokens: Number of valid tokens in the chunk (1-4).
-        """
-        dsa_mtp_e2e_show_hands_set_prefill_valid_tokens(num_valid_tokens, self.is_glm5)
+    def set_prefill_valid_tokens(self, num_valid_tokens: int, with_mtp: bool | None = None) -> None:
+        """Select prefill (num_valid_tokens > 0) vs decode (0) mode."""
+        active_mtp = with_mtp if with_mtp is not None else self.with_mtp
+        dsa_mtp_e2e_show_hands_set_prefill_valid_tokens(num_valid_tokens, self.is_glm5, active_mtp)
 
     def set_prefill_mtp_extra_token(self, token: int) -> None:
-        """Set the extra token for MTP[0] shifted input during prefill.
-
-        Args:
-            token: The prompt token at (cur_pos + mtp_seq_len).
-        """
+        """Set the extra token for MTP[0] shifted input during prefill."""
         dsa_mtp_e2e_show_hands_set_prefill_mtp_extra_token(token, self.is_glm5)
 
     def get_next_draft_tokens(self, device_id: int = 0) -> torch.Tensor:
-        """Get next_draft_tokens from the specified device.
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            next_draft_tokens tensor of shape [1, MTP_SEQ_LEN].
-        """
+        """Get next_draft_tokens from the specified device."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return intermediates[Idx.NEXT_DRAFT_TOKENS]
 
     def get_num_accepted(self, device_id: int = 0) -> int:
-        """Get number of accepted tokens from the specified device.
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            Number of accepted tokens.
-        """
+        """Get number of accepted tokens from the specified device."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return int(intermediates[Idx.ACCEPTED_TOKENS][0].item())
 
     def get_predicted_tokens(self, device_id: int = 0) -> torch.Tensor:
-        """Get predicted_tokens from the specified device.
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            predicted_tokens tensor containing main model predictions.
-        """
+        """Get predicted_tokens from the specified device."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return intermediates[Idx.PREDICTED_TOKENS]
 
     def get_logits(self, device_id: int = 0) -> torch.Tensor:
-        """Get logits from the specified device.
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            Logits tensor of shape [batch, seq_len, vocab_size] (FP32).
-        """
+        """Get logits from the specified device."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return intermediates[Idx.LOGITS_OUT]
 
     def get_top_n_logprobs(self, device_id: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get top-N log-probabilities and token IDs from the top_p kernel.
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            Tuple of (log_probs, token_ids):
-              - log_probs: [batch, seq_len, 256] FP32
-              - token_ids: [batch, seq_len, 256] INT32
-        """
+        """Get top-N log-probabilities and token IDs from the top_p kernel."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return (
             intermediates[Idx.TOP_N_LOG_PROBS],
@@ -680,23 +677,12 @@ class ShowHandsDSALayer:
         )
 
     def get_token_logprob(self, device_id: int = 0) -> torch.Tensor:
-        """Get log-probability of the sampled token (from TOP_P_SCORES).
-
-        Args:
-            device_id: Device ID to get results from.
-
-        Returns:
-            Tensor of shape [batch, seq_len] (FP32).
-        """
+        """Get log-probability of the sampled token (from TOP_P_SCORES)."""
         intermediates, _, _, _ = self._get_device_result(device_id)
         return intermediates[Idx.TOP_P_SCORES]
 
     def set_logprobs_enabled(self, enabled: bool) -> None:
-        """Enable or disable logprobs export in the top_p kernel.
-
-        Args:
-            enabled: True to enable logprobs export, False to disable.
-        """
+        """Enable or disable logprobs export in the top_p kernel."""
         flag_val = 1 if enabled else 0
         for device_id in range(self.num_devices):
             intermediates, _, _, _ = self._get_device_result(device_id)

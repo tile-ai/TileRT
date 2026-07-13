@@ -26,17 +26,6 @@ def projx_wis(
     profile_logs: torch.Tensor,
     model_arch: str,
 ) -> None:
-    """
-    Define the ProjxWis operation.
-
-    Args:
-        x_in: Input tensor.
-        w: Weight tensor.
-        output: Output tensor.
-        compute_kernel_type: Compute kernel type ("bf16" or "bf16mma").
-        profile_logs: Profile logs tensor.
-        model_arch: Model architecture ("deepseek_v3_2" or "glm_5").
-    """
     torch.ops.tilert.proj_w_op(x_in, w, output, model_arch, compute_kernel_type, profile_logs)
 
 
@@ -125,7 +114,7 @@ class ProjxWis(TileRTModule):
 
     @staticmethod
     def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
-        """Swizzle each 16x16 BF16 tile for the packed weight layout."""
+        """Swizzle each 16x16 BF16 tile for MMA loading."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
@@ -135,7 +124,6 @@ class ProjxWis(TileRTModule):
     def _to_hmma_layout(
         w_orig: torch.Tensor, n_ctas: int, rows_per_cta: int, x_dim: int, num_pages: int
     ) -> torch.Tensor:
-        """Convert [output_dim, x_dim] BF16 weights to the packed kernel layout."""
         cols_per_page = x_dim // num_pages
         n_k_tiles = cols_per_page // 16
         w = w_orig.reshape(n_ctas, rows_per_cta, num_pages, cols_per_page)
@@ -153,15 +141,6 @@ class ProjxWis(TileRTModule):
         return [self.tilert_w]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding: replicate weight for each device.
-
-        Args:
-            weights_map: Map from ref weight alias to tensor.
-
-        Returns:
-            Map from tilert weight alias to (num_devices, ...) tensors.
-        """
         w = weights_map[self.ref_weights_alias.w_weights]
         if self.compute_kernel_type == "bf16mma":
             n_ctas, rows_per_cta, num_pages = self._HMMA_CONFIGS[self.dim]
@@ -177,7 +156,17 @@ class ProjxWis(TileRTModule):
         self.is_ref_weights_init = True
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        self.tilert_w = state_dict[self.tilert_weights_alias.w_weights].detach().clone()
+        w = state_dict[self.tilert_weights_alias.w_weights].detach().clone()
+        if (
+            self.compute_kernel_type == "bf16mma"
+            and w.dim() == 2
+            and (w.shape[0] == self.index_n_heads and w.shape[1] == self.dim)
+        ):
+            n_ctas, rows_per_cta, num_pages = self._HMMA_CONFIGS[self.dim]
+            w = self._to_hmma_layout(
+                w.to(torch.bfloat16), n_ctas, rows_per_cta, self.dim, num_pages
+            )
+        self.tilert_w = w
         self.is_tilert_weights_init = True
 
     def init_random_weights(self) -> None:

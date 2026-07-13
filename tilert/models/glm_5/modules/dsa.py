@@ -4,10 +4,10 @@ import torch
 
 from tilert.models.base import SerializableTileRTModule
 from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
-from tilert.models.glm_5._dsa_v32.modules.mlp import MlpBlock
-from tilert.models.glm_5._dsa_v32.modules.moe import MoeBlock
 from tilert.models.glm_5._dsa_v32.ops import RMSNormHeadProj
-from tilert.models.glm_5._dsa_v32.temp_var_indices import TEMP_VARS_SIZE, Idx
+from tilert.models.glm_5.modules.mlp import MlpBlock
+from tilert.models.glm_5.modules.moe import MoeBlock
+from tilert.models.glm_5.temp_var_indices import TEMP_VARS_SIZE, Idx
 
 
 class Dsa(SerializableTileRTModule):
@@ -26,7 +26,7 @@ class Dsa(SerializableTileRTModule):
             num_devices=num_devices,
             remove_selected=True,
         )
-        from tilert.models.glm_5._dsa_v32.modules.mla_v2 import (
+        from tilert.models.glm_5.modules.mla_v2 import (
             PureMlaV2,
             SparseSelectMlaV2,
         )
@@ -39,17 +39,17 @@ class Dsa(SerializableTileRTModule):
         if device_id == 0:
             self.v2_peer_bufs = torch.zeros(n_peers, dtype=torch.int64, device=dev)
             self.v2_partial_buf = torch.zeros(
-                model_args.max_batch_size, 4, model_args.dim, dtype=torch.bfloat16, device=dev
+                model_args.max_batch_size, 8, model_args.dim, dtype=torch.bfloat16, device=dev
             )
             mla_kwargs = {
                 "peer_bufs": self.v2_peer_bufs,
                 "partial_buf": self.v2_partial_buf,
             }
         else:
-            max_seq_len = getattr(model_args, "num_mtp", 3) + 1
+            max_seq_len = max(getattr(model_args, "num_mtp", 3) + 1, 8)
             topk = model_args.index_topk
-            self.v2_ll_buf = torch.zeros(max_seq_len * topk * 2, dtype=torch.int32, device=dev)
-            mla_kwargs = {"ll_buf": self.v2_ll_buf}
+            self.v2_recv_buf = torch.zeros(max_seq_len * topk * 2, dtype=torch.int32, device=dev)
+            mla_kwargs = {"recv_buf": self.v2_recv_buf}
 
         mla_num_devices: int | None = None
         if device_id != 0:
@@ -139,7 +139,6 @@ class Dsa(SerializableTileRTModule):
         n_index_heads = self.model_args.index_n_heads
         max_seq_len = self.model_args.max_seq_len
         index_topk = self.model_args.index_topk
-        n_routed_experts = self.model_args.n_routed_experts
         n_activated_experts = self.model_args.n_activated_experts
         n_total_experts = self.model_args.n_activated_experts + self.model_args.n_shared_experts
         moe_inter_dim = self.model_args.moe_inter_dim // self.num_devices
@@ -168,7 +167,10 @@ class Dsa(SerializableTileRTModule):
         temp_vars[Idx.O_LSE_ACC] = torch.empty(*batch_seq, n_local_heads, 32, **fp32_desc)
         temp_vars[Idx.PROJ_O] = torch.zeros(*batch_seq, n_local_heads, v_head_dim, **bf16_desc)
         temp_vars[Idx.UNPROJ_O] = torch.zeros(*batch_seq, dim, **bf16_desc)
-        temp_vars[Idx.SCORES] = torch.zeros(*batch_seq, n_routed_experts, **fp32_desc)
+        temp_vars[Idx.SCORES] = torch.full((4096,), float("nan"), **fp32_desc)
+        temp_vars[Idx.HIDDEN_MID] = torch.full(
+            (1, 8, n_activated_experts + 1, 256), float("nan"), **bf16_desc
+        )
         temp_vars[Idx.X_MLP_IN] = torch.zeros(*batch_seq, dim, **bf16_desc)
         exp_up_gate = torch.zeros(*batch_seq, n_total_experts, moe_inter_dim, **bf16_desc)
         temp_vars[Idx.UP_GATE] = exp_up_gate
@@ -221,6 +223,14 @@ class Dsa(SerializableTileRTModule):
         temp_vars[Idx.TOP_N_LOG_PROBS] = torch.zeros(*batch_seq, max_top_n, **fp32_desc)
         temp_vars[Idx.TOP_N_INDICES] = torch.zeros(*batch_seq, max_top_n, **int32_desc)
         temp_vars[Idx.LOGPROBS_FLAG] = torch.zeros(1, **int32_desc)
+
+        ar_max_steps = 1024
+        temp_vars[Idx.AR_ACCEPTED_TOKENS] = torch.zeros(1 + ar_max_steps * seq_len, **int32_desc)
+        temp_vars[Idx.AR_NUM_ACCEPTED] = torch.zeros(1 + ar_max_steps, **int32_desc)
+
+        temp_vars[Idx.GRAMMAR_BITMASK] = torch.full(
+            (*batch_seq, vocab_size // 32), -1, **int32_desc
+        )
 
         for i, t in enumerate(temp_vars):
             if t is None:

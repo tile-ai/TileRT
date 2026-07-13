@@ -13,6 +13,9 @@ from tilert.models.glm_5._dsa_v32.ops.expert_sel_up_gate_silu import (
     ExpertSelectUpGateSiLU,
     ExpertSelectUpGateSiLUWeightsConverter,
 )
+from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
+    RMSNormProjQKVAW8A16MMAWeightsConverter,
+)
 from tilert.utils import get_profile_log_tensor
 
 __all__ = [
@@ -49,6 +52,63 @@ class RMSNormUpGateSiLUAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
+    BF16MMA = "bf16mma"
+    BF16MMA_V2 = "w8a16_hmma_v2"
+
+
+def _pack_up_gate_w8a16_v2(
+    gate_w: torch.Tensor,
+    gate_s: torch.Tensor,
+    up_w: torch.Tensor,
+    up_s: torch.Tensor,
+    hidden_dim: int = 6144,
+) -> torch.Tensor:
+    """Pack GLM5 dense gate/up FP8 weight + block scales into the V2 blob."""
+    C = RMSNormProjQKVAW8A16MMAWeightsConverter
+    rows_per_cta = C.ROWS_PER_CTA
+    cols_per_page = C.COLS_PER_PAGE
+    block = C.BLOCK_SIZE
+    num_warps = C.NUM_WARPS
+    k_tiles = C.K_TILES_PER_WARP
+    scales_per_set = C.SCALES_PER_PAGE
+    page_mat_bytes = C.PAGE_MAT_BYTES
+    page_bytes = C.PAGE_BYTES
+
+    gate_w = gate_w.reshape(-1, hidden_dim).contiguous()
+    up_w = up_w.reshape(-1, hidden_dim).contiguous()
+    assert gate_w.dtype == torch.float8_e4m3fn and up_w.dtype == torch.float8_e4m3fn
+    inter = gate_w.shape[0]
+    num_ctas = inter // 16
+    num_pages = hidden_dim // cols_per_page
+    device = gate_w.device
+
+    gate_s = gate_s.reshape(-1, hidden_dim // block).to(torch.float32).contiguous()
+    up_s = up_s.reshape(-1, hidden_dim // block).to(torch.float32).contiguous()
+
+    gate_c = gate_w.reshape(num_ctas, 16, hidden_dim)
+    up_c = up_w.reshape(num_ctas, 16, hidden_dim)
+    w = torch.cat([gate_c, up_c], dim=1).contiguous()
+    w_bytes = w.view(torch.uint8)
+
+    w = w_bytes.reshape(num_ctas, rows_per_cta, num_pages, cols_per_page)
+    w = w.reshape(num_ctas, C.M_TILES_PER_CTA, 16, num_pages, cols_per_page)
+    w = w.permute(0, 3, 1, 2, 4).contiguous()
+    w = w.reshape(num_ctas, num_pages, C.M_TILES_PER_CTA, 16, num_warps, k_tiles, 16)
+    w = w.permute(0, 1, 2, 5, 4, 3, 6).contiguous()
+    w_lane = C._permute_mma_a_fragment_16x16(w)
+    mat_blob = w_lane.contiguous().reshape(num_ctas, num_pages, page_mat_bytes)
+
+    cta_idx = torch.arange(num_ctas, device=device)
+    scale_row = cta_idx // (block // 16)
+    gate_cta = gate_s[scale_row].reshape(num_ctas, num_pages, scales_per_set)
+    up_cta = up_s[scale_row].reshape(num_ctas, num_pages, scales_per_set)
+    scale16 = torch.cat([gate_cta, up_cta], dim=2).contiguous()
+    scale_bytes = scale16.view(torch.uint8)
+
+    out = torch.zeros(num_ctas, num_pages, page_bytes, dtype=torch.uint8, device=device)
+    out[:, :, :page_mat_bytes] = mat_blob
+    out[:, :, page_mat_bytes : page_mat_bytes + 16 * 4] = scale_bytes
+    return out.reshape(-1).contiguous().view(torch.float8_e4m3fn)
 
 
 RMSNormUpGateSiLUWeightsConverter = ExpertSelectUpGateSiLUWeightsConverter
@@ -83,8 +143,15 @@ class RMSNormUpGateSiLU(TileRTModule):
     """RMSNormUpGateSiLU module"""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [RMSNormUpGateSiLUAlgorithm.FP8MMA, RMSNormUpGateSiLUAlgorithm.FP16MMA],
-        "glm_5": [RMSNormUpGateSiLUAlgorithm.FP8MMA, RMSNormUpGateSiLUAlgorithm.FP16MMA],
+        "deepseek_v3_2": [
+            RMSNormUpGateSiLUAlgorithm.FP8MMA,
+            RMSNormUpGateSiLUAlgorithm.FP16MMA,
+            RMSNormUpGateSiLUAlgorithm.BF16MMA,
+        ],
+        "glm_5": [
+            RMSNormUpGateSiLUAlgorithm.BF16MMA,
+            RMSNormUpGateSiLUAlgorithm.BF16MMA_V2,
+        ],
     }
 
     def __init__(
@@ -146,12 +213,6 @@ class RMSNormUpGateSiLU(TileRTModule):
         return self.tilert_weights_alias()
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """
-        Get the weights list.
-
-        Returns:
-            List of weights.
-        """
         return [self.tilert_norm_gamma, self.tilert_weights, self.tilert_scales]
 
     def device_sharding(
@@ -159,15 +220,6 @@ class RMSNormUpGateSiLU(TileRTModule):
         weights_dict: dict[str, torch.Tensor],
         key_prefix: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Device sharding.
-
-        Args:
-            weights_dict: Dictionary of weights.
-
-        Returns:
-            Tuple of weights.
-        """
         rmsnorm_gamma_key = f"{key_prefix}.post_attention_layernorm.weight"
         if ".mlp" in key_prefix:
             key_prefix_without_mlp = key_prefix.replace(".mlp", "")
@@ -210,13 +262,6 @@ class RMSNormUpGateSiLU(TileRTModule):
         key_prefix: str,
         device_id: int = 0,
     ) -> None:
-        """
-        Initialize the reference weights.
-
-        Args:
-            state_dict: State dictionary.
-            device_id: Device ID.
-        """
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         gamma = sharded_list[0][device_id]
@@ -237,25 +282,23 @@ class RMSNormUpGateSiLU(TileRTModule):
         self.ref_up = torch.stack(ref_up_list, dim=0)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize the tilert weights.
-
-        Args:
-            state_dict: State dictionary.
-        """
         assert self.algorithm is not None, "Algorithm is not set"
+        aliases = self.tilert_weights_alias()
+        if self.algorithm == RMSNormUpGateSiLUAlgorithm.BF16MMA_V2:
+            self.tilert_norm_gamma = state_dict[aliases[0]].float().contiguous()
+            self.tilert_weights = _pack_up_gate_w8a16_v2(
+                state_dict[aliases[1]],
+                state_dict[aliases[2]],
+                state_dict[aliases[3]],
+                state_dict[aliases[4]],
+                hidden_dim=self.dim,
+            )
+            return
         self.tilert_norm_gamma, self.tilert_weights = RMSNormUpGateSiLUWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tilert_weights_alias()])
+        ).dispatch(self.algorithm, [state_dict[alias] for alias in aliases])
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, dev_id: int = 0) -> None:
-        """
-        Initialize the tilert variables.
-
-        Args:
-            batch_size: Batch size.
-            seq_len: Sequence length.
-        """
         self.hidden_out = torch.zeros(
             (
                 batch_size,
@@ -270,13 +313,9 @@ class RMSNormUpGateSiLU(TileRTModule):
         self.profile_logs = get_profile_log_tensor(device=f"cuda:{dev_id}")
         self.is_init = True
 
-    def init_random_weights(self, dev_id: int = 0) -> None:
-        """
-        Initialize the random weights.
-
-        Returns:
-            None
-        """
+    def init_random_weights(self, dev_id: int | None = None) -> None:
+        if dev_id is None:
+            dev_id = self.device_id
         gamma = torch.randn(self.dim, dtype=torch.float32, device=f"cuda:{dev_id}")
         gate_weights = torch.randn(
             self.inter_dim, self.dim, dtype=torch.bfloat16, device=f"cuda:{dev_id}"

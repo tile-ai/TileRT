@@ -10,43 +10,7 @@ __all__ = [
 
 @dataclass
 class ModelArgs:
-    """
-    Data class for defining model arguments and hyperparameters.
-
-    Attributes:
-        arch_name (str): Architecture name.
-        max_batch_size (int): Maximum batch size.
-        max_seq_len (int): Maximum sequence length.
-        dtype (Literal["bf16", "fp8"]): Data type for computations.
-        scale_fmt (Optional[str]): Format for quantization scale.
-        vocab_size (int): Vocabulary size.
-        dim (int): Model dimension.
-        inter_dim (int): Intermediate dimension for MLP layers.
-        moe_inter_dim (int): Intermediate dimension for MoE layers.
-        n_layers (int): Number of transformer layers.
-        n_dense_layers (int): Number of dense layers in the model.
-        n_heads (int): Number of attention heads.
-        n_routed_experts (int): Number of routed experts for MoE layers.
-        n_shared_experts (int): Number of shared experts for MoE layers.
-        n_activated_experts (int): Number of activated experts in MoE layers.
-        n_expert_groups (int): Number of expert groups.
-        n_limited_groups (int): Number of limited groups for MoE routing.
-        score_func (Literal["softmax", "sigmoid"]): Scoring function for MoE routing.
-        route_scale (float): Scaling factor for routing scores.
-        q_lora_rank (int): LoRA rank for query projections.
-        kv_lora_rank (int): LoRA rank for key-value projections.
-        qk_nope_head_dim (int): Dimension for query-key projections without positional embeddings.
-        qk_rope_head_dim (int): Dimension for query-key projections with rotary embeddings.
-        v_head_dim (int): Dimension for value projections.
-        original_seq_len (Optional[int]): Original sequence length.
-        rope_theta (float): Base for rotary positional encoding.
-        rope_factor (Optional[float]): Scaling factor for extended sequence lengths.
-        beta_fast (Optional[int]): Fast beta correction factor.
-        beta_slow (Optional[int]): Slow beta correction factor.
-        mscale (float): Scaling factor for extended attention.
-        index_head_dim (int): Dimension for index head.
-        index_topk (int): Top-k for index head.
-    """
+    """Data class for defining model arguments and hyperparameters."""
 
     arch_name = "deepseek_v3_2"
 
@@ -54,6 +18,7 @@ class ModelArgs:
     max_seq_len: int = 160 * 1024
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: str | None = None
+    fp8_kv_cache: bool = False
 
     vocab_size: int = 129280
     dim: int = 7168

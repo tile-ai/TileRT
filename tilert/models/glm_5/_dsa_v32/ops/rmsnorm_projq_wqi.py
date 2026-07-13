@@ -1,4 +1,4 @@
-"""RmsnormProjqWqi operation module (IQ-only projection)."""
+"""RmsnormProjqWqi operation module (GLM5 v2, IQ-only projection)."""
 
 from dataclasses import dataclass
 from enum import Enum
@@ -44,6 +44,7 @@ class RmsnormProjqWqiAlgorithm(Enum):
     """RmsnormProjqWqi algorithm."""
 
     FP16MMA = "fp16mma"
+    BF16MMA = "bf16mma"
 
 
 class RmsnormProjqWqiWeightsConverter(TilertWeightsConverter):
@@ -71,7 +72,6 @@ class RmsnormProjqWqiWeightsConverter(TilertWeightsConverter):
     def _swizzle_mma_16x16_for_pages(
         mat_in: torch.Tensor, q_lora_rank: int, pages: int
     ) -> torch.Tensor:
-        """Swizzle a 16xK matrix for the paged weight layout (K divisible by 16)."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == q_lora_rank
         pre_shape = mat_in.shape[:-2]
         k_per_page = q_lora_rank // pages
@@ -87,7 +87,6 @@ class RmsnormProjqWqiWeightsConverter(TilertWeightsConverter):
         wqi_scales: torch.Tensor,
         rmsnorm_gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert common weights to the packed TileRT FP16 layout (IQ only)."""
         sms = 128
         k_per_page = 1024 if self.model_args.arch_name == "glm_5" else 512
         pages = self.q_lora_dim // k_per_page
@@ -128,14 +127,14 @@ class RmsnormProjqWqiWeightsConverter(TilertWeightsConverter):
         tilert_gamma = rmsnorm_gamma.float().detach().clone()
         return tilert_wqi, tilert_wqi_scales, tilert_gamma
 
+    def convert_to_bf16mma(
+        self, weights: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.convert_to_fp16mma(weights)
+
     def convert_to_fp16mma(
         self, weights: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert common-format weights to TileRT FP16 MMA layout.
-
-        Args:
-            weights: [wqi, wqi_scale, q_norm_weight].
-        """
         with torch.inference_mode():
             wqi, wqi_scale, q_norm_weight = weights
             return self._common_to_tilert_fp16mma(wqi, wqi_scale, q_norm_weight)
@@ -177,8 +176,14 @@ class RmsnormProjqWqi(TileRTModule):
     """RmsnormProjqWqi module: RMSNorm + W_qi projection (IQ only, GLM5 v2)."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [RmsnormProjqWqiAlgorithm.FP16MMA],
-        "glm_5": [RmsnormProjqWqiAlgorithm.FP16MMA],
+        "deepseek_v3_2": [
+            RmsnormProjqWqiAlgorithm.FP16MMA,
+            RmsnormProjqWqiAlgorithm.BF16MMA,
+        ],
+        "glm_5": [
+            RmsnormProjqWqiAlgorithm.FP16MMA,
+            RmsnormProjqWqiAlgorithm.BF16MMA,
+        ],
     }
 
     def __init__(
@@ -240,7 +245,6 @@ class RmsnormProjqWqi(TileRTModule):
         }
 
     def init_reference_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize reference weights from common-format state dict."""
         self.ref_q_norm = state_dict[self.tilert_weights_alias.rmsnorm_gamma]
         wqi = weight_dequant(
             state_dict[self.tilert_weights_alias.wqi_weights],
@@ -249,21 +253,19 @@ class RmsnormProjqWqi(TileRTModule):
         self.ref_wqi = wqi.contiguous()
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize TileRT weights from common-format state dict."""
+        assert self.algorithm is not None, "Algorithm is not set"
         weights = [
+            state_dict[self.tilert_weights_alias.rmsnorm_gamma],
             state_dict[self.tilert_weights_alias.wqi_weights],
             state_dict[self.tilert_weights_alias.wqi_scales],
-            state_dict[self.tilert_weights_alias.rmsnorm_gamma],
         ]
-        assert self.algorithm is not None, "Algorithm is not set"
         self.tilert_wqi, self.tilert_wqi_scales, self.tilert_q_norm_weight = (
-            RmsnormProjqWqiWeightsConverter(self.model_args, self.num_devices).dispatch(
-                self.algorithm, weights
+            torch.ops.tilert.rmsnorm_projq_wqi__convert_weights(
+                weights, self.model_args.arch_name, self.algorithm.value
             )
         )
 
     def init_random_weights(self) -> None:
-        """Initialize random reference and TileRT weights for testing."""
         q_norm = torch.randn(self.q_lora_rank, dtype=torch.float32)
         wqi = torch.randn(self.index_head_dim, self.q_lora_rank, dtype=torch.bfloat16).to(
             torch.float8_e4m3fn
@@ -281,7 +283,6 @@ class RmsnormProjqWqi(TileRTModule):
         self.init_tilert_weights(ref_state)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
-        """Allocate TileRT output buffers."""
         self.iq = torch.zeros(
             batch_size, seq_len, self.index_n_heads, self.head_dim, dtype=torch.bfloat16
         )
@@ -289,7 +290,6 @@ class RmsnormProjqWqi(TileRTModule):
         self.is_var_init = True
 
     def golden_forward(self, q: torch.Tensor) -> torch.Tensor:
-        """Reference forward: RMSNorm + W_qi_b linear projection."""
         assert self.ref_q_norm is not None
         assert self.ref_wqi is not None
 

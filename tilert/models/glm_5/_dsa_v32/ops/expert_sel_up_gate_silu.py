@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
+
 import torch
 import torch.nn.functional as F
 
@@ -29,10 +30,14 @@ def expert_select_up_gate_silu(
     hidden_out: torch.Tensor,
     expert_probs_out: torch.Tensor,
     expert_indices_out: torch.Tensor,
-    profile_logs: torch.Tensor,
+    profile_logs: torch.Tensor | None = None,
     algorithm: str = "fp8mma",
     *,
     model_arch: str,
+    tid2eid: torch.Tensor | None = None,
+    token_id: torch.Tensor | None = None,
+    experts_weights_32row: torch.Tensor | None = None,
+    shared_experts_weights: torch.Tensor | None = None,
 ) -> None:
     """Expert SelectUpGateSiLU operation."""
     torch.ops.tilert.expert_select_up_gate_silu_op(
@@ -46,6 +51,10 @@ def expert_select_up_gate_silu(
         profile_logs,
         model_arch,
         algorithm,
+        tid2eid,
+        token_id,
+        experts_weights_32row,
+        shared_experts_weights,
     )
 
 
@@ -69,6 +78,16 @@ class ExpertSelectUpGateSiLURefWeightsAlias:
             + [f"{self.key_prefix}.experts.{i}.gate_proj.weight_scale_inv" for i in range(n)]
             + [f"{self.key_prefix}.shared_experts.up_proj.weight_scale_inv"]
             + [f"{self.key_prefix}.experts.{i}.up_proj.weight_scale_inv" for i in range(n)]
+        )
+
+    def fp4_routed_tensor_alias(self) -> list[str]:
+        n = self.n_routed_experts
+        return (
+            [f"{self.key_prefix}.gate.e_score_correction_bias"]
+            + [f"{self.key_prefix}.experts.{i}.gate_proj.weight" for i in range(n)]
+            + [f"{self.key_prefix}.experts.{i}.up_proj.weight" for i in range(n)]
+            + [f"{self.key_prefix}.experts.{i}.gate_proj.weight_scale" for i in range(n)]
+            + [f"{self.key_prefix}.experts.{i}.up_proj.weight_scale" for i in range(n)]
         )
 
     def __call__(self) -> list[str]:
@@ -104,6 +123,8 @@ class ExpertSelectUpGateSiLUAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
+    BF16MMA = "bf16mma"
+    GLM5_FP4_HMMA = "glm5_fp4_hmma"
 
 
 class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
@@ -135,16 +156,6 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
     def tilert_to_tilert_144sm(
         mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str | None = None
     ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-            mma_type: MMA type, None,"16x32" or "16x16"
-        Returns:
-            tilert_144sm weights and scales
-        """
         exp_num = mat_in.shape[0]
         assert mat_in.shape == (exp_num, 512, 7168)
         assert mat_scale_in.shape == (exp_num, 4, 64)
@@ -198,15 +209,6 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
     def tilert_to_tilert_144sm_mma(
         mat_in: torch.Tensor, mat_scale_in: torch.Tensor, mma_type: str = "16x32"
     ) -> torch.Tensor:
-        """
-        Convert tilert weights and scales to tilert_144sm_mma input format.
-
-        Args:
-            mat_in: tilert weights
-            mat_scale_in: tilert scales
-        Returns:
-            tilert_144sm weights and scales
-        """
         return ExpertSelectUpGateSiLUWeightsConverter.tilert_to_tilert_144sm(
             mat_in, mat_scale_in, mma_type
         )
@@ -303,30 +305,72 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
     def convert_to_fp8mma(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert the weights to fp8mma format.
-
-        Args:
-            weights: List of weights.
-
-        Returns:
-            Tuple of weights.
-        """
         return self.convert_to_mma(weights_list, "fp8mma")
 
     def convert_to_fp16mma(
         self, weights_list: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert the weights to fp16mma format.
-
-        Args:
-            weights: List of weights.
-
-        Returns:
-            Tuple of weights.
-        """
         return self.convert_to_mma(weights_list, "fp16mma")
+
+    def convert_to_bf16mma(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.convert_to_mma(weights_list, "fp16mma")
+
+    def convert_to_glm5_fp4_hmma(
+        self, weights_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from tilert.models.common_mxfp4 import (
+            _unpack_fp4_nibbles_last,
+            build_ug_weights_mma_natural,
+        )
+
+        assert (
+            len(weights_list) == 5
+        ), f"convert_to_glm5_fp4_hmma expects 5 tensors, got {len(weights_list)}"
+        bias, gate_fp4, gate_e8m0, up_fp4, up_e8m0 = weights_list
+        arch = self.model_args.arch_name
+        assert arch == "glm_5", f"GLM5_FP4_HMMA converter is GLM5-only, got arch={arch}"
+
+        dim = self.model_args.dim
+        moe_inter_pd = self.model_args.moe_inter_dim // self.num_devices
+
+        with torch.inference_mode():
+            def _ensure_unpacked(t: torch.Tensor) -> torch.Tensor:
+                if t.shape[-1] == dim:
+                    return t.to(torch.uint8).contiguous()
+                assert t.shape[-1] == dim // 2, (
+                    "routed fp4 weight last dim must be dim or dim/2; "
+                    f"got {t.shape[-1]} (dim={dim})"
+                )
+                return _unpack_fp4_nibbles_last(t)
+
+            gate_nib = _ensure_unpacked(gate_fp4)
+            up_nib = _ensure_unpacked(up_fp4)
+            gate_e8 = gate_e8m0.to(torch.uint8).contiguous()
+            up_e8 = up_e8m0.to(torch.uint8).contiguous()
+
+            n_routed = gate_nib.shape[0]
+            assert gate_nib.shape == (n_routed, moe_inter_pd, dim), (
+                f"gate_fp4 must be (n_routed, {moe_inter_pd}, {dim}); "
+                f"got {tuple(gate_nib.shape)}"
+            )
+
+            device = gate_nib.device
+            e_total = n_routed + 1
+            u8 = {"dtype": torch.uint8, "device": device}
+
+            def _slot0(nib: torch.Tensor, e8: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                full_nib = torch.zeros(e_total, moe_inter_pd, dim, **u8)
+                full_e8 = torch.zeros(e_total, moe_inter_pd, dim // 32, **u8)
+                full_nib[1:] = nib
+                full_e8[1:] = e8
+                return full_nib, full_e8
+
+            g_nib, g_e8 = _slot0(gate_nib, gate_e8)
+            u_nib, u_e8 = _slot0(up_nib, up_e8)
+            ug_packed = build_ug_weights_mma_natural(g_nib, g_e8, u_nib, u_e8, dim, moe_inter_pd)
+            return bias.float().contiguous(), ug_packed
 
 
 class ExpertSelectUpGateSiLU(TileRTModule):
@@ -336,10 +380,12 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         "deepseek_v3_2": [
             ExpertSelectUpGateSiLUAlgorithm.FP8MMA,
             ExpertSelectUpGateSiLUAlgorithm.FP16MMA,
+            ExpertSelectUpGateSiLUAlgorithm.BF16MMA,
         ],
         "glm_5": [
             ExpertSelectUpGateSiLUAlgorithm.FP8MMA,
             ExpertSelectUpGateSiLUAlgorithm.FP16MMA,
+            ExpertSelectUpGateSiLUAlgorithm.GLM5_FP4_HMMA,
         ],
     }
 
@@ -391,7 +437,11 @@ class ExpertSelectUpGateSiLU(TileRTModule):
 
         self.tilert_bias: torch.Tensor | None = None
         self.tilert_weights: torch.Tensor | None = None
-        self.tilert_scales = torch.zeros(1, dtype=torch.bfloat16, device=torch.device("cuda"))
+        self.tilert_scales = (
+            torch.zeros(1, dtype=torch.bfloat16, device=torch.device("cuda"))
+            if torch.cuda.is_available()
+            else None
+        )
 
         self.hidden_out: torch.Tensor | None = None
         self.expert_probs: torch.Tensor | None = None
@@ -417,12 +467,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         return self._tilert_tensor_alias
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """
-        Get the weights list.
-
-        Returns:
-            List of weights.
-        """
+        """Get the weights list."""
         return [self.tilert_bias, self.tilert_weights, self.tilert_scales]
 
     @staticmethod
@@ -454,16 +499,59 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         up_proj_scale = up_proj_scale.reshape(num_devices, 1, in_scale_dim_per_device, scale_dim)
         return gate_proj_weight, gate_proj_scale, up_proj_weight, up_proj_scale
 
+    @staticmethod
+    def _split_inter_axis(t: torch.Tensor, num_devices: int) -> torch.Tensor:
+        inter, k = t.shape[-2], t.shape[-1]
+        assert (
+            inter % num_devices == 0
+        ), f"moe-inter {inter} not divisible by num_devices {num_devices}"
+        return t.reshape(num_devices, 1, inter // num_devices, k)
+
+    def process_gate_up_weights_fp4(
+        self,
+        key_prefix: str,
+        weights_hf: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_dev = self.num_devices
+        gate_w = weights_hf[f"{key_prefix}.gate_proj.weight"]
+        gate_s = weights_hf[f"{key_prefix}.gate_proj.weight_scale"]
+        up_w = weights_hf[f"{key_prefix}.up_proj.weight"]
+        up_s = weights_hf[f"{key_prefix}.up_proj.weight_scale"]
+        return (
+            self._split_inter_axis(gate_w, n_dev),
+            self._split_inter_axis(gate_s, n_dev),
+            self._split_inter_axis(up_w, n_dev),
+            self._split_inter_axis(up_s, n_dev),
+        )
+
+    def _device_sharding_fp4(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        ref_alias = self.ref_weights_alias
+        key_prefix = ref_alias.key_prefix
+        bias = weights_map[f"{key_prefix}.gate.e_score_correction_bias"]
+        bias = bias[None, :].repeat(self.num_devices, 1)
+
+        gw, gs, uw, us = [], [], [], []
+        for exp_id in range(self.n_routed_experts):
+            g_w, g_s, u_w, u_s = self.process_gate_up_weights_fp4(
+                f"{key_prefix}.experts.{exp_id}", weights_map
+            )
+            gw.append(g_w)
+            gs.append(g_s)
+            uw.append(u_w)
+            us.append(u_s)
+        tilert_alias = self.tilert_weights_alias
+        return {
+            tilert_alias.exp_bias: bias,
+            tilert_alias.exp_gate_weights: torch.cat(gw, dim=1),
+            tilert_alias.exp_gate_scales: torch.cat(gs, dim=1),
+            tilert_alias.exp_up_weights: torch.cat(uw, dim=1),
+            tilert_alias.exp_up_scales: torch.cat(us, dim=1),
+        }
+
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding: ref state dict -> tilert sharded tensors (num_devices, ...).
+        if self.algorithm == ExpertSelectUpGateSiLUAlgorithm.GLM5_FP4_HMMA:
+            return self._device_sharding_fp4(weights_map)
 
-        Args:
-            weights_map: State dict keyed by ref_weights_alias().
-
-        Returns:
-            Dict keyed by tilert_weights_alias() with (num_devices, ...) tensors.
-        """
         ref_alias = self.ref_weights_alias
         key_prefix = ref_alias.key_prefix
 
@@ -513,13 +601,6 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         state_dict: dict[str, torch.Tensor],
         device_id: int | None = None,
     ) -> None:
-        """
-        Initialize the reference weights.
-
-        Args:
-            state_dict: State dict keyed by ref_weights_alias().
-            device_id: Device ID; defaults to self.device_id.
-        """
         did = self.device_id if device_id is None else device_id
         sharded = self.device_sharding(state_dict)
 
@@ -537,24 +618,36 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         ref_up_list = [
             weight_dequant(up_weights[i], up_scales[i]) for i in range(up_weights.shape[0])
         ]
-        self.ref_gate = torch.stack(ref_gate_list, dim=0)
-        self.ref_up = torch.stack(ref_up_list, dim=0)
+        self.ref_gate = torch.stack([t.to(torch.bfloat16) for t in ref_gate_list], dim=0)
+        self.ref_up = torch.stack([t.to(torch.bfloat16) for t in ref_up_list], dim=0)
+
+    def get_tilert_weights_alias(self) -> list[str]:
+        return list(self.tilert_weights_alias())
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize the tilert weights."""
         assert self.algorithm is not None, "Algorithm is not set"
+        if self.algorithm == ExpertSelectUpGateSiLUAlgorithm.GLM5_FP4_HMMA:
+            assert (
+                self.arch_name == "glm_5"
+            ), f"GLM5_FP4_HMMA is GLM5-only, got arch={self.arch_name}"
+            a = self.tilert_weights_alias
+            converter = ExpertSelectUpGateSiLUWeightsConverter(self.model_args, self.num_devices)
+            self.tilert_bias, self.tilert_weights = converter.convert_to_glm5_fp4_hmma(
+                [
+                    state_dict[a.exp_bias],
+                    state_dict[a.exp_gate_weights],
+                    state_dict[a.exp_gate_scales],
+                    state_dict[a.exp_up_weights],
+                    state_dict[a.exp_up_scales],
+                ]
+            )
+            return
+
         weights_list = [state_dict[alias] for alias in self.tilert_weights_alias()]
         converter = ExpertSelectUpGateSiLUWeightsConverter(self.model_args, self.num_devices)
         self.tilert_bias, self.tilert_weights = converter.dispatch(self.algorithm, weights_list)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device: str = "cuda") -> None:
-        """
-        Initialize the tilert variables.
-
-        Args:
-            batch_size: Batch size.
-            seq_len: Sequence length.
-        """
         self.hidden_out = torch.zeros(
             (
                 batch_size,
@@ -580,12 +673,6 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         self.is_init = True
 
     def init_random_weights(self, device: str = "cuda") -> None:
-        """
-        Initialize the random weights.
-
-        Returns:
-            None
-        """
         n = self.n_routed_experts + 1
         bias = torch.randn(self.n_routed_experts, dtype=torch.float32, device=device)
         gate_weights = list(
@@ -705,6 +792,8 @@ class ExpertSelectUpGateSiLU(TileRTModule):
         self,
         x_in: torch.Tensor,
         scores: torch.Tensor,
+        tid2eid: torch.Tensor | None = None,
+        token_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self.algorithm is not None, "Algorithm is not set"
         expert_select_up_gate_silu(
@@ -718,5 +807,7 @@ class ExpertSelectUpGateSiLU(TileRTModule):
             self.profile_logs,
             self.algorithm.value,
             model_arch=self.model_args.arch_name,
+            tid2eid=tid2eid,
+            token_id=token_id,
         )
         return self.hidden_out, self.expert_probs, self.expert_indices

@@ -31,20 +31,6 @@ def unproj_o_allreduce(
     model_arch: str,
     compute_kernel_type: str = "bf16",
 ) -> None:
-    """
-    Fused operation of unprojection and allreduce.
-
-    Args:
-        vec_in: Input tensor.
-        mat_in: Input tensor.
-        mat_scale: Input tensor.
-        x_in: Input tensor.
-        flag: Input flag.
-        vec_out: Output tensor.
-        profile_logs: Profile logs tensor.
-        model_arch: Model architecture ("deepseek_v3_2" or "glm_5").
-        compute_kernel_type: Compute kernel type ("bf16", "fp16mma").
-    """
     torch.ops.tilert.unproj_o_allreduce_op(
         vec_in,
         mat_in,
@@ -62,6 +48,7 @@ class UnProjOAllReduceAlgorithm(Enum):
     """UnprojOAllReduce algorithm"""
 
     FP16MMA = "fp16mma"
+    BF16MMA = "bf16mma"
 
 
 @dataclass
@@ -108,7 +95,6 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
         self,
         weights_list: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert weights to the packed kernel layout (GLM5 or DSV3.2)."""
         with torch.inference_mode():
             mat, scales = weights_list
             if scales.dtype != torch.float32:
@@ -186,6 +172,12 @@ class UnProjOAllReduceWeightsConverter(TilertWeightsConverter):
             dummy_scales = torch.zeros(1, dtype=torch.float32, device=mat.device)
             return mat_all, dummy_scales
 
+    def convert_to_bf16mma(
+        self,
+        weights_list: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.convert_to_fp16mma(weights_list)
+
     def convert_to_fp16mma(
         self,
         weights_list: list[torch.Tensor],
@@ -254,9 +246,11 @@ class UnProjOAllReduce(TileRTModule):
     _SUPPORTED_ALGORITHMS = {
         "deepseek_v3_2": [
             UnProjOAllReduceAlgorithm.FP16MMA,
+            UnProjOAllReduceAlgorithm.BF16MMA,
         ],
         "glm_5": [
             UnProjOAllReduceAlgorithm.FP16MMA,
+            UnProjOAllReduceAlgorithm.BF16MMA,
         ],
     }
 
@@ -314,24 +308,9 @@ class UnProjOAllReduce(TileRTModule):
         self.is_var_init = False
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """
-        Get the weights list.
-
-        Returns:
-            List of weights.
-        """
         return [self.tilert_weights, self.tilert_scales]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding.
-
-        Args:
-            weights_map: Map from ref weight alias to tensor (full model).
-
-        Returns:
-            Map from tilert weight alias to (num_devices, ...) tensors.
-        """
         unproj_o_weight = weights_map[self.ref_weights_alias.o_proj_weight]
         unproj_o_scale = weights_map[self.ref_weights_alias.o_proj_scale_inv]
 
@@ -393,13 +372,6 @@ class UnProjOAllReduce(TileRTModule):
         state_dict: dict[str, torch.Tensor],
         device_id: int | None = None,
     ) -> None:
-        """
-        Initialize the reference weights.
-
-        Args:
-            state_dict: State dictionary keyed by ref weight alias (full model).
-            device_id: Device ID for this shard; defaults to self.device_id.
-        """
         did = self.device_id if device_id is None else device_id
         sharded = self.device_sharding(state_dict)
         weights = sharded[self.tilert_weights_alias.unproj_weights][did]
@@ -407,12 +379,6 @@ class UnProjOAllReduce(TileRTModule):
         self.ref_unproj_o = weight_dequant(weights, scales)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize the tilert weights.
-
-        Args:
-            state_dict: State dictionary keyed by tilert weight alias (per-device).
-        """
         assert self.algorithm is not None, "Algorithm is not set"
         self.tilert_weights, self.tilert_scales = UnProjOAllReduceWeightsConverter(
             self.model_args, self.num_devices
@@ -422,13 +388,6 @@ class UnProjOAllReduce(TileRTModule):
         )
 
     def init_tilert_vars(self, batch_size: int, seq_len: int) -> None:
-        """
-        Initialize the tilert variables.
-
-        Args:
-            batch_size: Batch size.
-            seq_len: Sequence length.
-        """
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -438,7 +397,6 @@ class UnProjOAllReduce(TileRTModule):
         self.is_var_init = True
 
     def init_random_weights(self) -> None:
-        """Initialize the random weights."""
         unproj_o_weights = torch.randn(
             self.dim,
             self.n_heads * self.head_dim,
@@ -469,15 +427,6 @@ class UnProjOAllReduce(TileRTModule):
         self,
         vec_in: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass for the down-project module.
-
-        Args:
-            vec_in: Input vector.
-
-        Returns:
-            Output tensor.
-        """
         assert self.ref_unproj_o is not None
         bsz = vec_in.shape[0]
         seq_len = vec_in.shape[1]

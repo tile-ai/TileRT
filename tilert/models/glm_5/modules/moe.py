@@ -2,9 +2,9 @@ import torch
 
 from tilert.models.base import SerializableTileRTModule
 from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
-from tilert.models.glm_5._dsa_v32.modules.mla_v2 import PureMlaV2 as Mla
 from tilert.models.glm_5._dsa_v32.ops.expert_down_allreduce import (
     ExpertDownAllReduce,
+    ExpertDownAllReduceAlgorithm,
 )
 from tilert.models.glm_5._dsa_v32.ops.expert_sel_up_gate_silu import (
     ExpertSelectUpGateSiLU,
@@ -13,6 +13,7 @@ from tilert.models.glm_5._dsa_v32.ops.expert_sel_up_gate_silu import (
 from tilert.models.glm_5._dsa_v32.ops.rmsnorm_expert_proj import (
     RMSNormExpertProj,
 )
+from tilert.models.glm_5.modules.mla_v2 import PureMlaV2 as Mla
 
 
 class Moe(SerializableTileRTModule):
@@ -32,12 +33,16 @@ class Moe(SerializableTileRTModule):
             model_args=model_args,
             device_id=device_id,
             num_devices=num_devices,
-            algorithm=ExpertSelectUpGateSiLUAlgorithm.FP16MMA,
+            algorithm=ExpertSelectUpGateSiLUAlgorithm.BF16MMA,
         )
         self.register_op(self.exp_sel_up_gate_silu)
 
+        _expert_down_algo = ExpertDownAllReduceAlgorithm.BF16MMA
         self.expert_down_allreduce = ExpertDownAllReduce(
-            model_args=model_args, device_id=device_id, num_devices=num_devices
+            model_args=model_args,
+            device_id=device_id,
+            num_devices=num_devices,
+            algorithm=_expert_down_algo,
         )
         self.register_op(self.expert_down_allreduce)
 

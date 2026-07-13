@@ -4,13 +4,12 @@ import os
 import time
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from tilert import logger
-from tilert.models.glm_5._dsa_v32.generator import stats_time
 from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
-from tilert.models.glm_5._dsa_v32.modules.end2end import ShowHandsDSALayer
-from tilert.models.glm_5._dsa_v32.temp_var_indices import Idx
+from tilert.models.glm_5.modules.end2end import ShowHandsDSALayer
+from tilert.models.glm_5.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
 
 __all__ = [
@@ -34,18 +33,7 @@ class GLM5Generator:
         enable_thinking: bool = False,
         sampling_seed: int = 42,
     ):
-        """Initialize the ShowHandsGeneratorGlm5.
-
-        Args:
-            max_new_tokens: Maximum number of new tokens to generate. Defaults to 100.
-            temperature: Temperature for sampling. Defaults to 1.0.
-            model_weights_dir: Path of the model weights directory.
-            with_mtp: Whether to use MTP (Multi-Token Prediction) for speculative decoding.
-            top_p: Top-p (nucleus) sampling threshold. Defaults to 0.9.
-            top_k: Top-k sampling threshold. Defaults to 256.
-            use_topp: Whether to use top-p sampling. Defaults to False (top-1 argmax).
-            enable_thinking: Whether to enable thinking mode in chat template.
-        """
+        """Initialize the ShowHandsGeneratorGlm5."""
         torch.set_num_threads(64)
         self.model_weights_dir = model_weights_dir
 
@@ -56,9 +44,14 @@ class GLM5Generator:
         self.sampling_seed = sampling_seed
 
         self.config = model_args
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_weights_dir, trust_remote_code=True
-        )  # nosec B615
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_weights_dir, trust_remote_code=True
+            )  # nosec B615
+        except (ValueError, KeyError):
+            self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                self.model_weights_dir, trust_remote_code=True
+            )  # nosec B615
         jinja_file_path = os.path.join(self.model_weights_dir, "chat_template.jinja")
         with open(jinja_file_path, encoding="utf-8") as f:
             chat_template = f.read()
@@ -89,6 +82,7 @@ class GLM5Generator:
             model_args=self.config,
             model_path=self.model_weights_dir,
             with_mtp=with_mtp,
+            temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             use_topp=use_topp,
@@ -111,12 +105,8 @@ class GLM5Generator:
         self.decode_layer.from_pretrained(self.model_weights_dir)
 
     def extract_ffn_cache(self) -> tuple[dict[int, list], dict[int, set[str]]]:
-        """Extract MOE/MLP op objects and skip keys from current loaded weights.
-
-        Returns:
-            Tuple of (cached_ffn_ops_per_device, skip_keys_per_device).
-        """
-        from tilert.models.glm_5._dsa_v32.modules.end2end import (
+        """Extract MOE/MLP op objects and skip keys from current loaded weights."""
+        from tilert.models.glm_5.modules.end2end import (
             _extract_ffn_ops,
             _get_moe_weight_keys,
         )
@@ -162,20 +152,7 @@ class GLM5Generator:
         with_mtp: bool | None = None,
         prompt_tokens: list[int] | None = None,
     ) -> tuple[str, list[float], list[int], int]:
-        """Main function to load the model and perform single sequence generation.
-
-        Args:
-            prompt: The input prompt string.
-            print_log: Whether to print generation logs.
-            with_mtp: Override MTP mode for this call. None uses self.with_mtp.
-                Requires MTP weights to have been loaded (self.with_mtp=True).
-            prompt_tokens: Pre-tokenized prompt tokens. If provided, skip tokenization
-                and use these tokens directly (useful for exact-length benchmarking).
-
-        Returns:
-            Tuple of (result_text, time_list, accepted_counts, prompt_len).
-            accepted_counts is empty for non-MTP mode.
-        """
+        """Main function to load the model and perform single sequence generation."""
         active_mtp = with_mtp if with_mtp is not None else self.with_mtp
         if active_mtp and not self.with_mtp:
             raise ValueError("Cannot use MTP mode: MTP weights were not loaded")
@@ -183,7 +160,7 @@ class GLM5Generator:
         if active_mtp:
             return self._generate_with_mtp(prompt, print_log, prompt_tokens=prompt_tokens)
         result, time_list, prompt_len = self._generate_without_mtp(
-            prompt, print_log, with_mtp=active_mtp, prompt_tokens=prompt_tokens
+            prompt, print_log, prompt_tokens=prompt_tokens
         )
         return result, time_list, [], prompt_len
 
@@ -191,10 +168,9 @@ class GLM5Generator:
         self,
         prompt: str,
         print_log: bool = True,
-        with_mtp: bool = False,
         prompt_tokens: list[int] | None = None,
     ) -> tuple[str, list[float], int]:
-        """Standard generation without MTP."""
+        """Standard generation without MTP (unified single-op decode)."""
         if prompt_tokens is None:
             messages = [{"role": "user", "content": prompt}]
             prompt_tokens = self.tokenizer.apply_chat_template(
@@ -202,6 +178,7 @@ class GLM5Generator:
                 tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=self.enable_thinking,
+                return_dict=False,
             )
 
         max_seq_len = self.config.max_seq_len
@@ -214,50 +191,65 @@ class GLM5Generator:
         tokens[0, :prompt_len] = torch.tensor(
             prompt_tokens, dtype=torch.long, device=self.default_device
         )
-        prompt_mask = tokens != -1
 
-        prev_pos = 0
-        finished = torch.tensor(
-            [False] * self.batch_size, dtype=torch.bool, device=self.default_device
-        )
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
+        return self._decode_without_mtp_ar(tokens, prompt_len, total_len, ar_steps, print_log)
 
-        time_list = []
-        for cur_pos_val in range(1, total_len):
+    def _decode_without_mtp_ar(
+        self,
+        tokens: torch.Tensor,
+        prompt_len: int,
+        total_len: int,
+        ar_steps: int,
+        print_log: bool,
+    ) -> tuple[str, list[float], int]:
+        """w/o-MTP decode (unified single-op, unified-style)."""
+        time_list: list[float] = []
+
+        self.decode_layer.set_prefill_valid_tokens(1, with_mtp=False)
+        for prev_pos in range(prompt_len - 1):
+            self.decode_layer.forward(tokens[0, prev_pos], with_mtp=False)
+        self.decode_layer.set_prefill_valid_tokens(0, with_mtp=False)
+
+        cur_pos = prompt_len - 1
+        prev_token = tokens[0, prompt_len - 1].reshape(1).to(torch.int32)
+        finished = False
+        while cur_pos < total_len - 1 and not finished:
             start_time = time.time()
-            multi_devices_results = self.decode_layer.forward(
-                tokens[0, prev_pos], with_mtp=with_mtp
-            )
-            end_time = time.time()
-            time_list.append(end_time - start_time)
+            self.decode_layer.show_hands_no_mtp(prev_token, ar_steps)
+            elapsed = time.time() - start_time
 
-            intermediates, *_ = multi_devices_results[0]
-            next_token = intermediates[Idx.TOKEN_OUT][0][0]
+            acc = self.decode_layer.ar_accepted_tokens_no_mtp(0).cpu()
+            n_tokens = int(acc[0].item())
+            emitted = acc[1 : 1 + n_tokens].tolist()
+            per_step_time = elapsed / max(1, n_tokens)
 
-            next_token = torch.where(
-                prompt_mask[0, cur_pos_val], tokens[0, cur_pos_val], next_token
-            )
-            tokens[0, cur_pos_val] = next_token
-            is_stop_token = next_token.item() in self.stop_token_ids
-            finished |= torch.logical_and(
-                ~prompt_mask[0, cur_pos_val],
-                torch.tensor(is_stop_token, dtype=torch.bool, device=self.default_device),
-            )
-            prev_pos = cur_pos_val
-            if cur_pos_val >= prompt_len:
-                decoded_tokens = self.tokenizer.decode(
-                    [next_token.item()], skip_special_tokens=True
-                )
-                if print_log:
-                    print(decoded_tokens, end="", flush=True)
-
-            if finished.all():
-                break
+            last_tok = int(prev_token[0].item())
+            for tok in emitted:
+                if cur_pos + 1 >= total_len:
+                    break
+                tokens[0, cur_pos + 1] = tok
+                cur_pos += 1
+                last_tok = tok
+                if cur_pos >= prompt_len and print_log:
+                    print(
+                        self.tokenizer.decode([tok], skip_special_tokens=True),
+                        end="",
+                        flush=True,
+                    )
+                time_list.append(per_step_time)
+                if tok in self.stop_token_ids:
+                    finished = True
+                    break
+            prev_token = torch.tensor([last_tok], dtype=torch.int32, device=self.default_device)
 
         if print_log:
             print("\n")
             logger.info(f"--Number of tokens generated: {len(time_list)}")
-
-            stats_time(time_list, "==== Performance ====")
+            if time_list:
+                total_t = sum(time_list)
+                tps = len(time_list) / total_t if total_t > 0 else 0
+                logger.info(f"--Effective TPS (AR, ar_steps={ar_steps}): {tps:.2f} tokens/s")
             print("\n")
 
         self.decode_layer.reset_sequence()
@@ -267,14 +259,12 @@ class GLM5Generator:
             toks = toks[prompt_len : prompt_len + self.max_new_tokens]
             stop_idx = len(toks)
             for i, tok in enumerate(toks):
-                if tok in self.stop_token_ids:
+                if tok == -1 or tok in self.stop_token_ids:
                     stop_idx = i
                     break
             toks = toks[:stop_idx]
             completion_tokens.append(toks)
-
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-
         return f"{decoded_tokens[0]}\n" if decoded_tokens else "", time_list, prompt_len
 
     def _generate_with_mtp(
@@ -287,8 +277,10 @@ class GLM5Generator:
         if prompt_tokens is None:
             prompt_tokens = self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
+                tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=self.enable_thinking,
+                return_dict=False,
             )
 
         max_seq_len = self.config.max_seq_len
@@ -303,8 +295,6 @@ class GLM5Generator:
         )
 
         prefill_time_list = []
-        decode_time_list = []
-        decode_accepted_counts = []
         cur_pos = 0
 
         while cur_pos < prompt_len - 1:
@@ -345,72 +335,82 @@ class GLM5Generator:
 
         self.decode_layer.set_prefill_valid_tokens(0)
 
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
+        return self._decode_ar(tokens, cur_pos, prompt_len, total_len, ar_steps, print_log)
+
+    def _decode_ar(
+        self,
+        tokens: torch.Tensor,
+        cur_pos: int,
+        prompt_len: int,
+        total_len: int,
+        ar_steps: int,
+        print_log: bool,
+    ) -> tuple[str, list[float], list[int], int]:
+        """MTP decode (unified single-op, unified-style)."""
+        decode_time_list: list[float] = []
+        decode_accepted_counts: list[int] = []
+
+        last_token = tokens[0, prompt_len - 1].item()
+        prev_draft = torch.full(
+            (1, self.mtp_seq_len),
+            last_token,
+            dtype=torch.int32,
+            device=self.default_device,
+        )
+
         finished = False
         while cur_pos < total_len - 1 and not finished:
-            if cur_pos == prompt_len - 1:
-                last_token = tokens[0, prompt_len - 1].item()
-                draft_tokens = torch.full(
-                    (self.mtp_seq_len,),
-                    last_token,
-                    dtype=torch.long,
-                    device=self.default_device,
-                )
-                draft_tokens = draft_tokens.reshape(1, self.mtp_seq_len).to(torch.int32)
-            else:
-                draft_tokens = self.decode_layer.get_next_draft_tokens(0).reshape(
-                    1, self.mtp_seq_len
-                )
-
             start_time = time.time()
-            self.decode_layer.forward(draft_tokens, with_mtp=True)
-            end_time = time.time()
-            decode_time_list.append(end_time - start_time)
+            self.decode_layer.show_hands(prev_draft, ar_steps)
+            elapsed = time.time() - start_time
 
-            num_accepted = self.decode_layer.get_num_accepted(0)
-            predicted_tokens = self.decode_layer.get_predicted_tokens(0).flatten()
-            decode_accepted_counts.append(num_accepted)
+            acc = self.decode_layer.ar_accepted_tokens(0).cpu()
+            num = self.decode_layer.ar_num_accepted(0).cpu()
+            n_tokens = int(acc[0].item())
+            n_steps = int(num[0].item())
+            emitted = acc[1 : 1 + n_tokens].tolist()
+            per_step = num[1 : 1 + n_steps].tolist()
+            next_prev_draft = self.decode_layer.get_next_draft_tokens(0).reshape(
+                1, self.mtp_seq_len
+            )
 
-            num_output_tokens = num_accepted
-            for i in range(num_output_tokens):
-                if cur_pos + 1 + i >= total_len:
+            per_step_time = elapsed / max(1, len(per_step))
+            offset = 0
+            for na in per_step:
+                step_emit = emitted[offset : offset + na]
+                offset += na
+                for tok in step_emit:
+                    if cur_pos + 1 >= total_len:
+                        break
+                    tokens[0, cur_pos + 1] = tok
+                    cur_pos += 1
+                    if cur_pos >= prompt_len and print_log:
+                        print(
+                            self.tokenizer.decode([tok], skip_special_tokens=True),
+                            end="",
+                            flush=True,
+                        )
+                    if tok in self.stop_token_ids:
+                        finished = True
+                        break
+                decode_time_list.append(per_step_time)
+                decode_accepted_counts.append(na)
+                if finished or cur_pos >= total_len - 1:
                     break
-                new_token = int(predicted_tokens[i].item())
-                tokens[0, cur_pos + 1 + i] = new_token
-
-                if cur_pos + 1 + i >= prompt_len and print_log:
-                    decoded_text = self.tokenizer.decode([new_token], skip_special_tokens=True)
-                    print(decoded_text, end="", flush=True)
-
-                if new_token in self.stop_token_ids:
-                    finished = True
-                    break
-
-            cur_pos += num_accepted
+            prev_draft = next_prev_draft
 
         if print_log:
             print("\n")
             total_tokens = sum(decode_accepted_counts)
             logger.info(f"--Number of forward calls (decode): {len(decode_accepted_counts)}")
             logger.info(f"--Total tokens generated: {total_tokens}")
-            if len(decode_accepted_counts) > 0:
-                avg_accepted = sum(decode_accepted_counts) / len(decode_accepted_counts)
-                min_accepted = min(decode_accepted_counts)
-                max_accepted = max(decode_accepted_counts)
-                logger.info(
-                    f"--Accepted tokens per call: mean={avg_accepted:.2f}, "
-                    f"min={min_accepted}, max={max_accepted}"
-                )
-
             if decode_time_list:
                 total_decode_time = sum(decode_time_list)
                 effective_tps = total_tokens / total_decode_time if total_decode_time > 0 else 0
-                avg_time_ms = total_decode_time / len(decode_time_list) * 1000
                 logger.info(
-                    f"--Avg forward time: {avg_time_ms:.2f}ms, "
-                    + f"({1000 / avg_time_ms:.2f} forwards/s)"
+                    f"--Effective TPS (AR, ar_steps={ar_steps}): {effective_tps:.2f} tokens/s"
                 )
-                logger.info(f"--Effective TPS (with MTP): {effective_tps:.2f} tokens/s")
-
             print("\n")
 
         self.decode_layer.reset_sequence()
@@ -428,7 +428,6 @@ class GLM5Generator:
             completion_tokens.append(toks)
 
         decoded_tokens = self.tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
-
         return (
             f"{decoded_tokens[0]}\n" if decoded_tokens else "",
             decode_time_list,
@@ -442,32 +441,7 @@ class GLM5Generator:
         start_pos: int = 0,
         end_pos: int | None = None,
     ) -> None:
-        """Inject external cache data into TileRT for P/D separation.
-
-        This API allows injecting pre-computed KI/KV/PE cache data from an external
-        prefill system (e.g., SGLang), enabling prefill-decode disaggregation.
-
-        Args:
-            layer_caches: List of (ki, kv, pe) tuples for each layer (0 to NUM_LAYERS-1).
-                Each tensor should be BF16 with shape [seqlen, dim] where:
-                - ki: [seqlen, 128] - compressed key (index_head_dim)
-                - kv: [seqlen, 512] - compressed key-value (kv_lora_rank)
-                - pe: [seqlen, 64] - position encoding cache (qk_rope_head_dim)
-            start_pos: Start position in cache to write (0-indexed). Defaults to 0.
-            end_pos: End position in cache (exclusive). If None, uses seqlen from tensors.
-
-        Example:
-            >>> # Load cache from external prefill system
-            >>> layer_caches = []  # List of 78 (ki, kv, pe) tuples for GLM-5
-            >>> for layer_id in range(78):
-            ...     ki = load_ki_for_layer(layer_id)  # [seqlen, 128] bf16
-            ...     kv = load_kv_for_layer(layer_id)  # [seqlen, 512] bf16
-            ...     pe = load_pe_for_layer(layer_id)  # [seqlen, 64] bf16
-            ...     layer_caches.append((ki, kv, pe))
-            >>> generator.inject_cache(layer_caches, start_pos=0)
-            >>> generator.set_cur_pos(seqlen)  # Set RoPE position
-            >>> # Continue generation from cache
-        """
+        """Inject external cache data into TileRT for P/D separation."""
         num_layers = len(layer_caches)
         if num_layers == 0:
             logger.warning("inject_cache called with empty layer_caches")
@@ -501,49 +475,25 @@ class GLM5Generator:
                 caches[base_idx + 1][0, start_pos:end_pos, :].copy_(kv_src)
                 caches[base_idx + 2][0, start_pos:end_pos, :].copy_(pe_src)
 
+            torch.cuda.synchronize(device_id)
+
         logger.info(f"Cache injection completed for {num_devices} devices")
 
     def set_cur_pos(self, cur_pos: int) -> None:
-        """Set the current position for RoPE.
-
-        This should be called after inject_cache() to ensure the runtime position
-        matches the injected cache length, for correct RoPE position encoding
-        during continued generation.
-
-        Args:
-            cur_pos: The current sequence position (typically the length of prefilled tokens).
-
-        Example:
-            >>> generator.inject_cache(layer_caches, start_pos=0)
-            >>> generator.set_cur_pos(prefill_len)  # Set position to prefill length
-            >>> # Now generate continues from the correct position
-        """
+        """Set the current position for RoPE in C++ backend."""
         if self.with_mtp:
             num_devices = self.decode_layer.num_devices
             for device_id in range(num_devices):
                 intermediates, _, _, _ = self.decode_layer._get_device_result(device_id)
                 cur_pos_tensor = intermediates[Idx.CUR_POS]
                 cur_pos_tensor.fill_(cur_pos)
+                torch.cuda.synchronize(device_id)
         else:
             torch.ops.tilert.dsa_show_hands_set_cur_pos_glm5(cur_pos)
             logger.info(f"Set cur_pos to {cur_pos}")
 
     def inject_last_hidden_state(self, last_hidden_state: torch.Tensor) -> None:
-        """Inject the last hidden state for MTP mode.
-
-        For MTP (Multi-Token Prediction), the MTP preprocess layer needs the
-        last hidden state from the main model's last token.
-
-        Args:
-            last_hidden_state: [hidden_size] or [1, hidden_size] BF16 tensor.
-                The hidden state of the last token from prefill.
-
-        Example:
-            >>> # After inject_cache, inject the last hidden state for MTP
-            >>> generator.inject_last_hidden_state(last_hidden_state)
-            >>> generator.set_cur_pos(prefill_len)
-            >>> # Then start generation
-        """
+        """Inject the last hidden state for MTP mode."""
         if not self.with_mtp:
             logger.warning("inject_last_hidden_state called but with_mtp is False, skipping")
             return
@@ -557,5 +507,6 @@ class GLM5Generator:
             lhs_tensor = intermediates[Idx.LAST_HIDDEN_STATES]
             lhs_src = last_hidden_state.to(f"cuda:{device_id}")
             lhs_tensor[0, 0, :].copy_(lhs_src.squeeze(0))
+            torch.cuda.synchronize(device_id)
 
         logger.info(f"Injected last_hidden_state to {num_devices} devices")

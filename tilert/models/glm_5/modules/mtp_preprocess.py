@@ -70,18 +70,7 @@ class MTPPreprocessWeightsConverter(TilertWeightsConverter):
     """Converts ref-format weights to TileRT format for MTP preprocess."""
 
     def convert_to_tilert(self, weights: list[torch.Tensor], device_id: int) -> list[torch.Tensor]:
-        """
-        Convert ref weights to TileRT format for a specific device.
-
-        Args:
-            weights: [embedding_rmsnorm_gamma, hidden_rmsnorm_gamma, eh_proj.weight]
-                     Ref format: enorm.weight [7168], hnorm.weight [7168],
-                     eh_proj.weight [7168, 14336].
-            device_id: Target device ID for weight placement.
-
-        Returns:
-            MTPPreprocessParams with converted weights for device_id.
-        """
+        """Convert ref weights to TileRT format for a specific device."""
         device = torch.device(f"cuda:{device_id}")
         embedding_rmsnorm_gamma, hidden_rmsnorm_gamma, eh_proj_weight = weights
 
@@ -165,14 +154,7 @@ class MTPPreprocessLayer(TileRTModule):
         self.ref_eh_proj_weight = state_dict[self.ref_weights_alias.eh_proj]
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Load TileRT weights from state_dict.
-
-        state_dict may use:
-        - Full keys: layer_{layer_id}_{alias}_dev_{device_id}
-        - Short keys: embedding_rmsnorm_gamma, hidden_rmsnorm_gamma, eh_proj_weights
-        - Ref keys: enorm.weight, hnorm.weight, eh_proj.weight (then convert)
-        """
+        """Load TileRT weights from state_dict."""
         converter = MTPPreprocessWeightsConverter(self.model_args, self.num_devices)
         params = converter.convert_to_tilert(
             [state_dict[k] for k in self.tilert_weights_alias()], self.device_id
@@ -199,16 +181,7 @@ class MTPPreprocessLayer(TileRTModule):
         x: torch.Tensor,
         last_hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Reference forward: enorm(x), hnorm(last_hidden), concat & eh_proj.
-
-        Args:
-            x: [batch, seq_len, hidden_size] embedded tokens
-            last_hidden_states: [batch, seq_len, hidden_size] previous hidden
-
-        Returns:
-            [batch, seq_len, hidden_size] projected hidden
-        """
+        """Reference forward: enorm(x), hnorm(last_hidden), concat & eh_proj."""
         assert self.ref_embedding_rmsnorm_gamma is not None
         assert self.ref_hidden_rmsnorm_gamma is not None
         assert self.ref_eh_proj_weight is not None

@@ -2,9 +2,9 @@ import torch
 
 from tilert.models.base import SerializableTileRTModule
 from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
-from tilert.models.glm_5._dsa_v32.modules.moe import MoeBlock
-from tilert.models.glm_5._dsa_v32.modules.mtp_preprocess import MTPPreprocessLayer
 from tilert.models.glm_5._dsa_v32.ops import RMSNormHeadProj
+from tilert.models.glm_5.modules.moe import MoeBlock
+from tilert.models.glm_5.modules.mtp_preprocess import MTPPreprocessLayer
 
 
 class MTP(SerializableTileRTModule):

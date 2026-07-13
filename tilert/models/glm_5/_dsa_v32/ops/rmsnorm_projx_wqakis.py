@@ -21,7 +21,7 @@ __all__ = [
 
 
 class RMSNormProjxWqakisWeightsConverter(TilertWeightsConverter):
-    """Weight converter for RMSNormProjxWqakis."""
+    """Weight converter for RMSNormProjxWqakis (decoupled FP8 MMA)."""
 
     def __init__(self, model_args: ModelArgs, num_devices: int):
         super().__init__(model_args, num_devices)
@@ -29,14 +29,6 @@ class RMSNormProjxWqakisWeightsConverter(TilertWeightsConverter):
     def convert_to_decoupled(
         self, weights: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert weights to decoupled FP8 MMA format.
-
-        Args:
-            weights: [gamma, wq_a, wq_a_scale, wki, wki_scale, wis, wis_scale]
-
-        Returns:
-            (wqaki_packed, wis_bf16, gamma)
-        """
         arch_name = self.model_args.arch_name
         x_rmsnorm_gamma, wq_a, wq_a_scale, wki, wki_scale, wis, _wis_scale = weights
 
@@ -111,14 +103,21 @@ class RMSNormProjxWqakisAlgorithm(Enum):
     """RMSNormProjxWqakis algorithm."""
 
     FP8MMA = "fp8mma"
+    W8A16HMMA = "w8a16_hmma"
 
 
 class RMSNormProjxWqakis(TileRTModule):
-    """Decoupled RMSNorm + GEMV(W_q_a, W_ki, W_is)."""
+    """Decoupled RMSNorm + GEMV(W_q_a, W_ki, W_is) for Device Group A."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [RMSNormProjxWqakisAlgorithm.FP8MMA],
-        "glm_5": [RMSNormProjxWqakisAlgorithm.FP8MMA],
+        "deepseek_v3_2": [
+            RMSNormProjxWqakisAlgorithm.FP8MMA,
+            RMSNormProjxWqakisAlgorithm.W8A16HMMA,
+        ],
+        "glm_5": [
+            RMSNormProjxWqakisAlgorithm.FP8MMA,
+            RMSNormProjxWqakisAlgorithm.W8A16HMMA,
+        ],
     }
 
     def __init__(
@@ -183,7 +182,6 @@ class RMSNormProjxWqakis(TileRTModule):
         return [self.tilert_norm_gamma, self.tilert_wqakis, self.tilert_wis]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Repeat weights for device sharding."""
         input_layernorm_weight = (
             weights_map[self.ref_weights_alias.x_rmsnorm_gamma][None, ...]
             .float()
@@ -235,6 +233,31 @@ class RMSNormProjxWqakis(TileRTModule):
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         tilert_aliases = self.tilert_weights_alias()
         weights_list = [state_dict[alias] for alias in tilert_aliases]
+        if self.algorithm == RMSNormProjxWqakisAlgorithm.W8A16HMMA:
+            gamma, wq_a, wq_a_scale, wki, wki_scale, wis, _wis_scale = weights_list
+            if self.arch_name == "glm_5":
+                self.tilert_wqakis = ProjxWqakiWeightsConverter.convert_glm5_68cta_w8a16(
+                    wq_a, wq_a_scale, wki, wki_scale
+                )
+            else:
+                from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
+                    RMSNormProjQKVAW8A16MMAWeightsConverter,
+                )
+
+                w_fp8 = torch.cat(
+                    [
+                        wq_a.reshape(self.q_lora_rank, self.dim),
+                        wki.reshape(self.idx_head_dim, self.dim),
+                    ],
+                    dim=0,
+                ).contiguous()
+                scales = torch.cat([wq_a_scale, wki_scale], dim=0).to(torch.float32).contiguous()
+                self.tilert_wqakis = RMSNormProjQKVAW8A16MMAWeightsConverter.pack_lane_major(
+                    w_fp8, scales, self.dim
+                )
+            self.tilert_wis = wis.to(torch.bfloat16)
+            self.tilert_norm_gamma = gamma.float()
+            return
         converter = RMSNormProjxWqakisWeightsConverter(self.model_args, self.num_devices)
         result = converter.convert_to_decoupled(weights_list)
         self.tilert_wqakis, self.tilert_wis, self.tilert_norm_gamma = result
@@ -280,7 +303,6 @@ class RMSNormProjxWqakis(TileRTModule):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pure PyTorch reference: RMSNorm -> q, ki, idx_scores."""
         assert self.ref_norm_gamma is not None
         assert self.ref_wq_a is not None
         assert self.ref_wki is not None
@@ -302,7 +324,6 @@ class RMSNormProjxWqakis(TileRTModule):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run RMSNorm + ProjXWqaki + ProjXWis via TileRT CUDA kernels."""
         rmsnorm_quant(
             x.to(torch.bfloat16),
             self.tilert_norm_gamma,

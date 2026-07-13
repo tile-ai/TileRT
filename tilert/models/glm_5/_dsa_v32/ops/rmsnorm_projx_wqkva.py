@@ -16,7 +16,7 @@ __all__ = [
 
 
 class RMSNormProjQKVAFP8MMAWeightsConverter:
-    """Weight converter: pack FP8 weights into the kernel's packed layout."""
+    """Weight converter: pack FP8 weights into WqkvaPagedShared layout for the FP8 MMA kernel."""
 
     HIDDEN_DIM = 6144
     Q_LORA_RANK = 2048
@@ -32,11 +32,9 @@ class RMSNormProjQKVAFP8MMAWeightsConverter:
 
     MAT_BYTES = ROWS_PER_CTA * COLS_PER_PAGE
     SCALE_OFFSET = MAT_BYTES
-    PAGE_BYTES = ((MAT_BYTES + 128 + 127) // 128) * 128
 
     @staticmethod
     def _swizzle_mma_16x32(mat_in: torch.Tensor) -> torch.Tensor:
-        """Swizzle [*, 16, 32] tiles into the packed weight layout."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 32
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 4).transpose(-4, -3).transpose(-5, -4)
@@ -55,14 +53,7 @@ class RMSNormProjQKVAFP8MMAWeightsConverter:
         hidden_dim: int = 6144,
         q_lora_rank: int = 2048,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack FP8 weights for the FP8 MMA kernel.
-
-        Args:
-            hidden_dim: Model hidden dimension.
-            q_lora_rank: Q projection rank.
-        """
         C = RMSNormProjQKVAFP8MMAWeightsConverter
-        block_size = C.BLOCK_SIZE
         kv_lora_rank = C.KV_LORA_RANK
         qk_rope_head_dim = C.QK_ROPE_HEAD_DIM
 
@@ -73,54 +64,92 @@ class RMSNormProjQKVAFP8MMAWeightsConverter:
         expected = qk_rope_head_dim * hidden_dim
         assert w_pe.numel() == expected, f"w_pe numel {w_pe.numel()} != expected {expected}"
 
+        return C._pack_per_row_no_requant(
+            wq_a,
+            wkv_a,
+            w_pe,
+            wq_a_scale,
+            wkv_a_scale,
+            w_pe_scale,
+            attn_norm_weight,
+            hidden_dim=hidden_dim,
+            q_lora_rank=q_lora_rank,
+        )
+
+    @staticmethod
+    def _pack_per_row_no_requant(
+        wq_a: torch.Tensor,
+        wkv_a: torch.Tensor,
+        w_pe: torch.Tensor,
+        wq_a_scale: torch.Tensor,
+        wkv_a_scale: torch.Tensor,
+        w_pe_scale: torch.Tensor,
+        attn_norm_weight: torch.Tensor,
+        *,
+        hidden_dim: int,
+        q_lora_rank: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        C = RMSNormProjQKVAFP8MMAWeightsConverter
+        kv_lora_rank = C.KV_LORA_RANK
+        qk_rope_head_dim = C.QK_ROPE_HEAD_DIM
         total_rows = q_lora_rank + kv_lora_rank + qk_rope_head_dim
         num_ctas = total_rows // C.ROWS_PER_CTA
         num_pages = hidden_dim // C.COLS_PER_PAGE
 
-        wq_a_f = weight_dequant(wq_a.reshape(q_lora_rank, hidden_dim), wq_a_scale)
-        wkv_a_f = weight_dequant(wkv_a.reshape(kv_lora_rank, hidden_dim), wkv_a_scale)
-        w_pe_f = weight_dequant(w_pe.reshape(qk_rope_head_dim, hidden_dim), w_pe_scale)
-        w_float = torch.cat([wq_a_f, wkv_a_f, w_pe_f], dim=0)
+        num_tiles = C.COLS_PER_PAGE // 32
+        blk = C.BLOCK_SIZE
+        num_blk_page = C.COLS_PER_PAGE // blk
+        num_blk_total = hidden_dim // blk
 
-        w_blocks = w_float.reshape(total_rows, hidden_dim // block_size, block_size)
-        col_max = w_blocks.abs().amax(dim=(0, 2))
-        fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        w_scales = (col_max / fp8_max).clamp(min=1e-12)
+        w_fp8 = torch.cat(
+            [
+                wq_a.reshape(q_lora_rank, hidden_dim),
+                wkv_a.reshape(kv_lora_rank, hidden_dim),
+                w_pe.reshape(qk_rope_head_dim, hidden_dim),
+            ],
+            dim=0,
+        ).contiguous()
 
-        scales_expanded = w_scales.repeat_interleave(block_size)
-        w_scaled = w_float / scales_expanded.unsqueeze(0)
-        w_fp8 = w_scaled.to(torch.float8_e4m3fn)
+        def _bcast_block_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
+            s = scale.to(torch.float32).reshape(-1, num_blk_total)
+            return s.repeat_interleave(blk, dim=0)[:rows]
+
+        w_scales = torch.cat(
+            [
+                _bcast_block_scale(wq_a_scale, q_lora_rank),
+                _bcast_block_scale(wkv_a_scale, kv_lora_rank),
+                _bcast_block_scale(w_pe_scale, qk_rope_head_dim),
+            ],
+            dim=0,
+        ).clamp(
+            min=1e-12
+        )
 
         assert C.MAT_BYTES == C.SCALE_OFFSET, "Layout mismatch: scales must follow mat"
-        assert block_size == C.COLS_PER_PAGE // C.SCALES_PER_PAGE, "Block size mismatch"
-        assert w_scales.numel() == num_pages * C.SCALES_PER_PAGE, "Scale count mismatch"
 
         w_bytes = w_fp8.view(torch.uint8)
-        num_tiles = C.COLS_PER_PAGE // 32
-
         mat = w_bytes.reshape(num_ctas, C.ROWS_PER_CTA, num_pages, C.COLS_PER_PAGE)
         mat = mat.transpose(1, 2)
-
         mat = mat.reshape(num_ctas, num_pages, 2, 16, num_tiles, 32)
         mat = mat.transpose(3, 4)
         mat = C._swizzle_mma_16x32(mat)
         mat = mat.contiguous().reshape(num_ctas, num_pages, C.MAT_BYTES)
 
-        scales_f32 = w_scales.reshape(num_pages, C.SCALES_PER_PAGE).to(torch.float32).contiguous()
-        scales_bytes = scales_f32.view(torch.uint8)
-        scales_bytes = scales_bytes.unsqueeze(0).expand(num_ctas, -1, -1)
-
-        pad_size = C.PAGE_BYTES - C.MAT_BYTES - C.SCALES_PER_PAGE * 4
-        padding = torch.zeros(num_ctas, num_pages, pad_size, dtype=torch.uint8, device=w_fp8.device)
-
-        packed = torch.cat([mat, scales_bytes, padding], dim=-1)
+        sc = w_scales.reshape(num_ctas, C.ROWS_PER_CTA, num_pages, num_blk_page)
+        sc = sc.permute(0, 2, 1, 3).contiguous()
+        scales_bytes = (
+            sc.to(torch.float32)
+            .reshape(num_ctas, num_pages, C.ROWS_PER_CTA * num_blk_page)
+            .view(torch.uint8)
+        )
+        packed = torch.cat([mat, scales_bytes], dim=-1)
         packed = packed.contiguous().reshape(-1)
 
         return packed.view(torch.float8_e4m3fn), attn_norm_weight.clone()
 
 
 class RMSNormProjQKVAFP16MMAWeightsConverter:
-    """Weight converter: pack FP16 weights for the kernel."""
+    """Weight converter: pack FP16 weights for the MMA kernel."""
 
     KV_LORA_RANK = 512
     QK_ROPE_HEAD_DIM = 64
@@ -130,7 +159,6 @@ class RMSNormProjQKVAFP16MMAWeightsConverter:
 
     @staticmethod
     def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
-        """Swizzle [*, 16, 16] tiles into the packed weight layout."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
@@ -149,7 +177,6 @@ class RMSNormProjQKVAFP16MMAWeightsConverter:
         hidden_dim: int = 6144,
         q_lora_rank: int = 2048,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Pack weights into the FP16 layout expected by the kernel."""
         C = RMSNormProjQKVAFP16MMAWeightsConverter
         kv_lora_rank = C.KV_LORA_RANK
         qk_rope_head_dim = C.QK_ROPE_HEAD_DIM
@@ -182,10 +209,125 @@ class RMSNormProjQKVAFP16MMAWeightsConverter:
         return packed.view(torch.float16), attn_norm_weight.clone()
 
 
+class RMSNormProjQKVAW8A16MMAWeightsConverter:
+    """Pack FP8 weight + block scale into packed format."""
+
+    KV_LORA_RANK = 512
+    QK_ROPE_HEAD_DIM = 64
+    ROWS_PER_CTA = 32
+    COLS_PER_PAGE = 1024
+    BLOCK_SIZE = 128
+    NUM_WARPS = 8
+    MMA_K = 16
+    M_TILES_PER_CTA = ROWS_PER_CTA // 16
+    K_TILES_PER_WARP = COLS_PER_PAGE // (NUM_WARPS * MMA_K)
+    SCALES_PER_PAGE = COLS_PER_PAGE // BLOCK_SIZE
+    PAGE_MAT_BYTES = M_TILES_PER_CTA * K_TILES_PER_WARP * NUM_WARPS * 32 * 8
+    PAGE_BYTES = PAGE_MAT_BYTES + 128
+
+    @staticmethod
+    def _permute_mma_a_fragment_16x16(tile: torch.Tensor) -> torch.Tensor:
+        assert tile.shape[-2:] == (16, 16)
+        pre = tile.shape[:-2]
+        return (
+            tile.reshape(*pre, 2, 8, 2, 4, 2)
+            .permute(
+                *range(len(pre)),
+                len(pre) + 1,
+                len(pre) + 3,
+                len(pre) + 2,
+                len(pre) + 0,
+                len(pre) + 4,
+            )
+            .contiguous()
+            .reshape(*pre, 32, 8)
+        )
+
+    @staticmethod
+    def convert_to_w8a16_mma_gemv(
+        wq_a: torch.Tensor,
+        wq_a_scale: torch.Tensor,
+        wkv_a: torch.Tensor,
+        wkv_a_scale: torch.Tensor,
+        w_pe: torch.Tensor,
+        w_pe_scale: torch.Tensor,
+        attn_norm_weight: torch.Tensor,
+        *,
+        hidden_dim: int = 6144,
+        q_lora_rank: int = 2048,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        C = RMSNormProjQKVAW8A16MMAWeightsConverter
+        kv_lora_rank = C.KV_LORA_RANK
+        qk_rope_head_dim = C.QK_ROPE_HEAD_DIM
+        rows_per_cta = C.ROWS_PER_CTA
+        cols_per_page = C.COLS_PER_PAGE
+
+        w_fp8 = torch.cat(
+            [
+                wq_a.reshape(q_lora_rank, hidden_dim),
+                wkv_a.reshape(kv_lora_rank, hidden_dim),
+                w_pe.reshape(qk_rope_head_dim, hidden_dim),
+            ],
+            dim=0,
+        ).contiguous()
+        assert w_fp8.dtype == torch.float8_e4m3fn, f"expected fp8 weight, got {w_fp8.dtype}"
+
+        scales = (
+            torch.cat([wq_a_scale, wkv_a_scale, w_pe_scale], dim=0).to(torch.float32).contiguous()
+        )
+
+        total_rows = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+        num_ctas = total_rows // rows_per_cta
+        num_pages = hidden_dim // cols_per_page
+        expected_scale_rows = (total_rows + C.BLOCK_SIZE - 1) // C.BLOCK_SIZE
+        assert scales.shape == (expected_scale_rows, hidden_dim // C.BLOCK_SIZE), (
+            f"scales {tuple(scales.shape)} != "
+            f"{(expected_scale_rows, hidden_dim // C.BLOCK_SIZE)}"
+        )
+
+        del num_ctas, num_pages
+        return C.pack_lane_major(w_fp8, scales, hidden_dim), attn_norm_weight.clone()
+
+    @classmethod
+    def pack_lane_major(
+        cls, w_fp8: torch.Tensor, scales: torch.Tensor, hidden_dim: int
+    ) -> torch.Tensor:
+        assert w_fp8.dtype == torch.float8_e4m3fn, f"expected fp8 weight, got {w_fp8.dtype}"
+        rows_per_cta = cls.ROWS_PER_CTA
+        cols_per_page = cls.COLS_PER_PAGE
+        total_rows = w_fp8.shape[0]
+        num_ctas = total_rows // rows_per_cta
+        num_pages = hidden_dim // cols_per_page
+        scales = scales.to(torch.float32).contiguous()
+        device = w_fp8.device
+        w_bytes = w_fp8.view(torch.uint8)
+
+        w = w_bytes.reshape(num_ctas, rows_per_cta, num_pages, cols_per_page)
+        w = w.reshape(num_ctas, cls.M_TILES_PER_CTA, 16, num_pages, cols_per_page)
+        w = w.permute(0, 3, 1, 2, 4).contiguous()
+        w = w.reshape(
+            num_ctas, num_pages, cls.M_TILES_PER_CTA, 16, cls.NUM_WARPS, cls.K_TILES_PER_WARP, 16
+        )
+        w = w.permute(0, 1, 2, 5, 4, 3, 6).contiguous()
+        w_lane = cls._permute_mma_a_fragment_16x16(w)
+        mat_blob = w_lane.contiguous().reshape(num_ctas, num_pages, cls.PAGE_MAT_BYTES)
+
+        cta_idx = torch.arange(num_ctas, device=device)
+        scale_row = cta_idx // (cls.BLOCK_SIZE // rows_per_cta)
+        cta_scales = scales[scale_row].reshape(num_ctas, num_pages, cls.SCALES_PER_PAGE)
+        scale_bytes = cta_scales.contiguous().view(torch.uint8)
+
+        out = torch.zeros(num_ctas, num_pages, cls.PAGE_BYTES, dtype=torch.uint8, device=device)
+        out[:, :, : cls.PAGE_MAT_BYTES] = mat_blob
+        out[:, :, cls.PAGE_MAT_BYTES : cls.PAGE_MAT_BYTES + cls.SCALES_PER_PAGE * 4] = scale_bytes
+        return out.reshape(-1).contiguous().view(torch.float8_e4m3fn)
+
+
 class RMSNormProjxWqkvaAlgorithm(Enum):
     """RMSNormProjxWqkva algorithm."""
 
     DECOUPLED = "decoupled"
+    W8A16HMMA = "w8a16_hmma"
 
 
 class RMSNormProjxWqkvaWeightsConverter(TilertWeightsConverter):
@@ -197,11 +339,6 @@ class RMSNormProjxWqkvaWeightsConverter(TilertWeightsConverter):
     def convert_to_fp8_mma_gemv(
         self, weights: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert tilert weights list to the FP8 kernel-ready format.
-
-        Args:
-            weights: [gamma, wq_a, wq_a_scale, wkv_a, wkv_a_scale, w_pe, w_pe_scale]
-        """
         gamma, wq_a, wq_a_scale, wkv_a, wkv_a_scale, w_pe, w_pe_scale = weights
         return RMSNormProjQKVAFP8MMAWeightsConverter.convert_to_fp8_mma_gemv(
             wq_a,
@@ -218,11 +355,6 @@ class RMSNormProjxWqkvaWeightsConverter(TilertWeightsConverter):
     def convert_to_fp16_mma_gemv(
         self, weights: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Convert tilert weights list to the FP16 kernel-ready format.
-
-        Args:
-            weights: [gamma, wq_a, wq_a_scale, wkv_a, wkv_a_scale, w_pe, w_pe_scale]
-        """
         gamma, wq_a, wq_a_scale, wkv_a, wkv_a_scale, w_pe, w_pe_scale = weights
         return RMSNormProjQKVAFP16MMAWeightsConverter.convert_to_fp16_mma_gemv(
             wq_a,
@@ -288,11 +420,17 @@ class RMSNormProjxWqkvaTilertWeightsAlias:
 
 
 class RMSNormProjxWqkva(TileRTModule):
-    """Fused RMSNorm + GEMV(W_q_a, W_kv_a, W_pe)."""
+    """Fused RMSNorm + GEMV(W_q_a, W_kv_a, W_pe) for Device Group B."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [RMSNormProjxWqkvaAlgorithm.DECOUPLED],
-        "glm_5": [RMSNormProjxWqkvaAlgorithm.DECOUPLED],
+        "deepseek_v3_2": [
+            RMSNormProjxWqkvaAlgorithm.DECOUPLED,
+            RMSNormProjxWqkvaAlgorithm.W8A16HMMA,
+        ],
+        "glm_5": [
+            RMSNormProjxWqkvaAlgorithm.DECOUPLED,
+            RMSNormProjxWqkvaAlgorithm.W8A16HMMA,
+        ],
     }
 
     def __init__(
@@ -354,7 +492,6 @@ class RMSNormProjxWqkva(TileRTModule):
         return [self.tilert_norm_gamma, self.tilert_wqkva, self.tilert_wqkva_scales]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Repeat weights for device sharding."""
         input_layernorm_weight = (
             weights_map[self.ref_weights_alias.x_rmsnorm_gamma][None, ...]
             .float()
@@ -405,8 +542,27 @@ class RMSNormProjxWqkva(TileRTModule):
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
         tilert_aliases = self.tilert_weights_alias()
         weights_list = [state_dict[alias] for alias in tilert_aliases]
-        converter = RMSNormProjxWqkvaWeightsConverter(self.model_args, self.num_devices)
-        self.tilert_wqkva, self.tilert_norm_gamma = converter.convert_to_fp8_mma_gemv(weights_list)
+        if self.algorithm == RMSNormProjxWqkvaAlgorithm.W8A16HMMA:
+            gamma, wq_a, wq_a_scale, wkv_a, wkv_a_scale, w_pe, w_pe_scale = weights_list
+            self.tilert_wqkva, self.tilert_norm_gamma = (
+                RMSNormProjQKVAW8A16MMAWeightsConverter.convert_to_w8a16_mma_gemv(
+                    wq_a,
+                    wq_a_scale,
+                    wkv_a,
+                    wkv_a_scale,
+                    w_pe,
+                    w_pe_scale,
+                    gamma.float(),
+                    hidden_dim=self.dim,
+                    q_lora_rank=self.q_lora_rank,
+                )
+            )
+            self.tilert_norm_gamma = self.tilert_norm_gamma.float().contiguous()
+        else:
+            converter = RMSNormProjxWqkvaWeightsConverter(self.model_args, self.num_devices)
+            self.tilert_wqkva, self.tilert_norm_gamma = converter.convert_to_fp8_mma_gemv(
+                weights_list
+            )
         self.tilert_wqkva_scales = torch.zeros((1,), dtype=torch.float32)
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, max_len: int = 128) -> None:
@@ -437,9 +593,9 @@ class RMSNormProjxWqkva(TileRTModule):
         tensor_list = [
             torch.randn(self.dim, dtype=torch.float32),
             torch.randn(self.q_lora_rank, self.dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
-            torch.randn(q_scale_dim, dim_scale_dim, dtype=scale_dtype),
+            torch.randn(q_scale_dim, dim_scale_dim, dtype=scale_dtype).abs(),
             torch.randn(kv_mqa_rows, self.dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
-            torch.randn(kv_mqa_scale_dim, dim_scale_dim, dtype=scale_dtype),
+            torch.randn(kv_mqa_scale_dim, dim_scale_dim, dtype=scale_dtype).abs(),
         ]
         ref_state_dict = dict(zip(self.ref_weights_alias(), tensor_list))
         self.init_reference_weights(ref_state_dict)
@@ -475,7 +631,6 @@ class RMSNormProjxWqkva(TileRTModule):
         x: torch.Tensor,
         cur_pos: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run RMSNorm + 3-way GEMV via the TileRT CUDA kernels."""
         assert self.cur_pos is not None
         assert self.pe_cache_out is not None
         self.cur_pos.fill_(cur_pos)

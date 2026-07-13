@@ -19,18 +19,6 @@ def projx_wqaki(
     *,
     model_arch: str,
 ) -> None:
-    """FP8 projection for q, ki.
-
-    Args:
-        x_quant: FP8 quantized hidden states [1, seq_len, hidden_dim].
-        x_scale: Scale factors for x_quant.
-        wqaki: Packed FP8 weights + scales for q, ki.
-        out_q: Output q tensor.
-        out_ki: Output ki tensor.
-        profile_logs: Profile logs tensor.
-        compute_kernel_type: Kernel type ("fp8mma", "fp8mma_68cta", "fp8mma_136cta").
-        model_arch: Model architecture ("deepseek_v3_2" or "glm_5").
-    """
     torch.ops.tilert.projx_wqaki_op(
         x_quant,
         x_scale,
@@ -62,7 +50,6 @@ class ProjxWqakiWeightsConverter:
         wki: torch.Tensor,
         wki_scale: torch.Tensor,
     ) -> torch.Tensor:
-        """Convert DSV3.2 weights to the packed format expected by the kernel."""
         with torch.inference_mode():
             wq_a_scale = wq_a_scale.to(torch.bfloat16)
             wki_scale = wki_scale.to(torch.bfloat16)
@@ -153,7 +140,6 @@ class ProjxWqakiWeightsConverter:
         wki: torch.Tensor,
         wki_scale: torch.Tensor,
     ) -> torch.Tensor:
-        """Convert GLM5 weights to the packed format expected by the kernel."""
         with torch.inference_mode():
             wq_a_scale = wq_a_scale.to(torch.float32)
             wki_scale = wki_scale.to(torch.float32)
@@ -196,13 +182,29 @@ class ProjxWqakiWeightsConverter:
             return torch.cat([wqaki_raw, wqaki_scales, wqaki_padding], dim=-1).contiguous()
 
     @staticmethod
+    def convert_glm5_68cta_w8a16(
+        wq_a: torch.Tensor,
+        wq_a_scale: torch.Tensor,
+        wki: torch.Tensor,
+        wki_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
+            RMSNormProjQKVAW8A16MMAWeightsConverter,
+        )
+
+        with torch.inference_mode():
+            dim = 6144
+            w_fp8 = torch.cat([wq_a.reshape(2048, dim), wki.reshape(128, dim)], dim=0).contiguous()
+            scales = torch.cat([wq_a_scale, wki_scale], dim=0).to(torch.float32).contiguous()
+            return RMSNormProjQKVAW8A16MMAWeightsConverter.pack_lane_major(w_fp8, scales, dim)
+
+    @staticmethod
     def convert_glm5_136cta(
         wq_a: torch.Tensor,
         wq_a_scale: torch.Tensor,
         wki: torch.Tensor,
         wki_scale: torch.Tensor,
     ) -> torch.Tensor:
-        """Convert GLM5 weights to the packed format expected by the kernel."""
         with torch.inference_mode():
             wq_a_scale = wq_a_scale.to(torch.float32)
             wki_scale = wki_scale.to(torch.float32)

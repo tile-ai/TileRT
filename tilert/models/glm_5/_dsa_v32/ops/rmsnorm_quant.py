@@ -27,17 +27,6 @@ def rmsnorm_quant(
     *,
     model_arch: str,
 ) -> None:
-    """
-    Rmsnorm with optional activation quantization.
-
-    Args:
-        hidden_in: Input tensor (..., dim).
-        gamma_in: RMSNorm gamma (dim,).
-        hidden_out: RMSNorm output (..., dim).
-        quant_hidden_out: Optional quantized output (..., dim). If None, no quant.
-        quant_hidden_scale_out: Optional quant scale (..., dim // block_size). If None, no quant.
-        profile_logs: Optional profile logs tensor.
-    """
     if profile_logs is None:
         raise ValueError("profile_logs is required when calling rmsnorm_quant.")
 

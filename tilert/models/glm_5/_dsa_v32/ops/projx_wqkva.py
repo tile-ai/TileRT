@@ -10,6 +10,7 @@ from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
 from tilert.models.glm_5._dsa_v32.ops.rmsnorm_projx_wqkva import (
     RMSNormProjQKVAFP8MMAWeightsConverter,
     RMSNormProjQKVAFP16MMAWeightsConverter,
+    RMSNormProjQKVAW8A16MMAWeightsConverter,
 )
 from tilert.utils import get_profile_log_tensor
 
@@ -32,7 +33,7 @@ def projx_wqkva(
     *,
     model_arch: str,
 ) -> None:
-    """FP8 MMA projection for q, kv, pe_cache (DSV3.2)."""
+    """Standalone FP8 QMMA projection for q, kv, pe_cache."""
     torch.ops.tilert.projx_wqkva_op(
         x_quant,
         x_scale,
@@ -101,14 +102,19 @@ class ProjXWqkvaAlgorithm(Enum):
 
     FP8MMA = "fp8mma"
     FP16MMA = "fp16mma"
+    W8A16HMMA = "w8a16_hmma"
 
 
 class ProjXWqkva(TileRTModule):
-    """FP8 MMA projection module for q, kv, pe_cache."""
+    """Standalone FP8 QMMA GEMV for q, kv, pe_cache projections."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [ProjXWqkvaAlgorithm.FP8MMA],
-        "glm_5": [ProjXWqkvaAlgorithm.FP8MMA, ProjXWqkvaAlgorithm.FP16MMA],
+        "deepseek_v3_2": [ProjXWqkvaAlgorithm.FP8MMA, ProjXWqkvaAlgorithm.W8A16HMMA],
+        "glm_5": [
+            ProjXWqkvaAlgorithm.FP8MMA,
+            ProjXWqkvaAlgorithm.FP16MMA,
+            ProjXWqkvaAlgorithm.W8A16HMMA,
+        ],
     }
 
     def __init__(
@@ -156,11 +162,12 @@ class ProjXWqkva(TileRTModule):
         super().set_algorithm(algorithm)
         if algorithm == ProjXWqkvaAlgorithm.FP16MMA:
             self.compute_kernel_type = "fp16mma"
+        elif algorithm == ProjXWqkvaAlgorithm.W8A16HMMA:
+            self.compute_kernel_type = "w8a16_hmma"
         else:
             self.compute_kernel_type = "fp8mma"
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Repeat weights for device sharding."""
         q_a_proj_weight = weights_map[self.ref_weights_alias.q_a_weights][None, ...].repeat(
             self.num_devices, 1, 1
         )
@@ -222,6 +229,20 @@ class ProjXWqkva(TileRTModule):
                 hidden_dim=self.dim,
                 q_lora_rank=self.q_lora_rank,
             )
+        elif self.algorithm == ProjXWqkvaAlgorithm.W8A16HMMA:
+            self.tilert_wqkva, _ = (
+                RMSNormProjQKVAW8A16MMAWeightsConverter.convert_to_w8a16_mma_gemv(
+                    wq_a,
+                    wq_a_scale,
+                    wkv_a,
+                    wkv_a_scale,
+                    w_pe,
+                    w_pe_scale,
+                    dummy_gamma,
+                    hidden_dim=self.dim,
+                    q_lora_rank=self.q_lora_rank,
+                )
+            )
         else:
             self.tilert_wqkva, _ = RMSNormProjQKVAFP8MMAWeightsConverter.convert_to_fp8_mma_gemv(
                 wq_a,
@@ -256,9 +277,9 @@ class ProjXWqkva(TileRTModule):
         tensor_list = [
             torch.randn(self.dim, dtype=torch.float32),
             torch.randn(self.q_lora_rank, self.dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
-            torch.randn(q_scale_dim, dim_scale_dim, dtype=scale_dtype),
+            torch.randn(q_scale_dim, dim_scale_dim, dtype=scale_dtype).abs(),
             torch.randn(kv_mqa_rows, self.dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn),
-            torch.randn(kv_mqa_scale_dim, dim_scale_dim, dtype=scale_dtype),
+            torch.randn(kv_mqa_scale_dim, dim_scale_dim, dtype=scale_dtype).abs(),
         ]
         ref_state_dict = dict(zip(self.ref_weights_alias(), tensor_list))
         self.init_reference_weights(ref_state_dict)
@@ -277,7 +298,10 @@ class ProjXWqkva(TileRTModule):
         assert self.ref_wkv_a is not None
         assert self.ref_w_pe is not None
 
-        if self.algorithm == ProjXWqkvaAlgorithm.FP16MMA:
+        if self.algorithm in (
+            ProjXWqkvaAlgorithm.FP16MMA,
+            ProjXWqkvaAlgorithm.W8A16HMMA,
+        ):
             x_float = x_quant.float()
         else:
             x_fp8 = x_quant.to(torch.float32)

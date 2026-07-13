@@ -30,18 +30,6 @@ def projo_wkvb(
     model_arch: str,
     compute_kernel_type: str = "fp16mma",
 ) -> None:
-    """
-    Define the ProjOWkvb operation.
-
-    Args:
-        o_in: Input tensor.
-        wkv_b_b: Weight tensor.
-        wkv_b_scales: Scale tensor.
-        output: Output tensor.
-        profile_logs: Profile logs tensor.
-        model_arch: Model architecture ("deepseek_v3_2" or "glm_5").
-        compute_kernel_type: Kernel type ("fp16mma" for both DSv32 and GLM5).
-    """
     torch.ops.tilert.projo_wkvb_op(
         o_in,
         wkv_b_b,
@@ -68,7 +56,6 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_mma_16x16(mat_in: torch.Tensor) -> torch.Tensor:
-        """Swizzle a [*, 16, 16] block for the packed weight layout."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == 16
         pre_shape = mat_in.shape[:-2]
         mat_in = mat_in.reshape(*pre_shape, 2, 8, 2, 4, 2).transpose(-4, -3).transpose(-5, -4)
@@ -76,7 +63,6 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
 
     @staticmethod
     def _swizzle_mma_16x16_for_pages(mat_in: torch.Tensor, k_dim: int, pages: int) -> torch.Tensor:
-        """Swizzle a [*, 16, K] matrix for the paged weight layout."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == k_dim
         pre_shape = mat_in.shape[:-2]
         k_per_page = k_dim // pages
@@ -87,17 +73,15 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
         return mat_in.contiguous()
 
     def convert_to_fp16mma(self, weights: list[torch.Tensor]) -> torch.Tensor:
-        """Convert weights to the packed format expected by the kernel."""
         with torch.inference_mode():
             wkv_b_b, wkv_b_b_scales = self.convert_to_general(weights)
 
             n_heads = wkv_b_b.size(0)
             v_head_dim = wkv_b_b.size(1)
             kv_lora_rank = wkv_b_b.size(2)
-            num_ctas = 80
-            rows_per_cta = (n_heads * v_head_dim) // num_ctas
-
             is_glm5 = self.model_args.arch_name == "glm_5"
+            num_ctas = (n_heads * v_head_dim) // 32 if is_glm5 else 80
+            rows_per_cta = (n_heads * v_head_dim) // num_ctas
 
             w_flat = wkv_b_b.reshape(num_ctas, rows_per_cta // 16, 16, kv_lora_rank)
             w_swizzled = ProjoWKVbWeightsConverter._swizzle_mma_16x16_for_pages(
@@ -114,7 +98,9 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
                 scales_per_cta = wkv_b_b_scales.repeat_interleave(ctas_per_scale_row, dim=1)
                 scales_per_cta = scales_per_cta.reshape(num_ctas, n_scale_k)
             else:
-                scales_per_cta = wkv_b_b_scales.squeeze(1).repeat_interleave(ctas_per_head, dim=0)
+                scales_per_cta = wkv_b_b_scales.squeeze(1).repeat_interleave(
+                    ctas_per_head, dim=0
+                )
 
             scale_dtype = torch.float32
             scales_per_cta = scales_per_cta.to(scale_dtype)
@@ -131,7 +117,6 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
             return torch.cat([w_bytes, scales_raw, padding], dim=-1).contiguous()
 
     def convert_to_bf16mma(self, weights: list[torch.Tensor]) -> torch.Tensor:
-        """Convert weights to the packed format expected by the BF16 kernel."""
         with torch.inference_mode():
             tilert_wkv_b_weights, tilert_wkv_b_scales = weights
 
@@ -169,7 +154,8 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
             wkv_bf16 = (w.float() * s).to(torch.bfloat16)
             n_heads = n_local_heads
 
-            num_ctas = 80
+            is_glm5 = self.model_args.arch_name == "glm_5"
+            num_ctas = (n_heads * v_head_dim) // 32 if is_glm5 else 80
             rows_per_cta = (n_heads * v_head_dim) // num_ctas
 
             w_flat = wkv_bf16.reshape(num_ctas, rows_per_cta // 16, 16, kv_lora_rank)
@@ -328,15 +314,6 @@ class ProjoWKVb(TileRTModule):
         return [self.tilert_wkv_b_b, self.tilert_wkv_b_b_scales]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Device sharding: split weights and scales per device.
-
-        Args:
-            weights_map: Map from ref weight alias to tensor.
-
-        Returns:
-            Map from tilert weight alias to (num_devices, ...) tensors.
-        """
         kv_b_proj_weight = weights_map[self.ref_weights_alias.wkv_b_weights]
         kv_b_proj_weight_scale = weights_map[self.ref_weights_alias.wkv_b_scales]
 
@@ -403,7 +380,6 @@ class ProjoWKVb(TileRTModule):
         self.init_tilert_weights_hmma(state_dict)
 
     def init_tilert_weights_hmma(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize with HMMA-packed weights."""
         packed = ProjoWKVbWeightsConverter(self.model_args, self.num_devices).dispatch(
             ProjoWKVbAlgorithm.FP16MMA,
             [
@@ -416,7 +392,6 @@ class ProjoWKVb(TileRTModule):
         self.compute_kernel_type = "fp16mma"
 
     def init_tilert_weights_hmma_bf16(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """Initialize with BF16 HMMA-packed weights (dequantized, no scales)."""
         packed = ProjoWKVbWeightsConverter(self.model_args, self.num_devices).dispatch(
             ProjoWKVbAlgorithm.BF16MMA,
             [

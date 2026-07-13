@@ -32,20 +32,7 @@ def down_allreduce(
     model_arch: str,
     compute_kernel_type: str = "bf16",
 ) -> None:
-    """
-    Fused operation of down and allreduce.
-
-    Args:
-        vec_in: Input tensor.
-        mat_in: Input tensor.
-        mat_scale: Input tensor.
-        x_in: Input tensor.
-        flag: Input flag.
-        vec_out: Output tensor.
-        profile_logs: Profile logs tensor (1D).
-        model_arch: Model architecture ("deepseek_v3_2" or "glm_5").
-        compute_kernel_type: Compute kernel type ("bf16").
-    """
+    """Fused operation of down and allreduce."""
     torch.ops.tilert.down_allreduce_op(
         vec_in,
         mat_in,
@@ -63,6 +50,8 @@ class DownAllReduceAlgorithm(Enum):
     """DownAllReduce algorithm"""
 
     GENERAL = "general"
+    BF16MMA = "bf16mma"
+    BF16MMA_V2 = "bf16mma_v2"
 
 
 DownAllReduceWeightsConverter = ExpertDownAllReduceWeightsConverter
@@ -88,7 +77,11 @@ class DownAllReduce(TileRTModule):
 
     _SUPPORTED_ALGORITHMS = {
         "deepseek_v3_2": [DownAllReduceAlgorithm.GENERAL],
-        "glm_5": [DownAllReduceAlgorithm.GENERAL],
+        "glm_5": [
+            DownAllReduceAlgorithm.GENERAL,
+            DownAllReduceAlgorithm.BF16MMA,
+            DownAllReduceAlgorithm.BF16MMA_V2,
+        ],
     }
 
     def __init__(
@@ -119,10 +112,14 @@ class DownAllReduce(TileRTModule):
         self.moe_inter_scale_dim_per_device = self.moe_inter_dim_per_device // self.block_size
         self.algorithm = algorithm
 
-        if self.arch_name in ("deepseek_v3_2", "glm_5"):
-            self.compute_kernel_type = "bf16"
-        else:
+        if self.arch_name not in ("deepseek_v3_2", "glm_5"):
             raise ValueError(f"Unsupported architecture: {self.arch_name}")
+        if self.algorithm == DownAllReduceAlgorithm.BF16MMA:
+            self.compute_kernel_type = "bf16mma"
+        elif self.algorithm == DownAllReduceAlgorithm.BF16MMA_V2:
+            self.compute_kernel_type = "bf16mma_v2"
+        else:
+            self.compute_kernel_type = "bf16"
 
         self.model_arch = self.arch_name
 
@@ -153,12 +150,7 @@ class DownAllReduce(TileRTModule):
         return self.tilert_weights_alias.tilert_tensor_alias
 
     def get_weights_list(self) -> list[torch.Tensor]:
-        """
-        Get the weights list.
-
-        Returns:
-            List of weights.
-        """
+        """Get the weights list."""
         return [self.tilert_weights, self.tilert_scales]
 
     def device_sharding(
@@ -166,15 +158,7 @@ class DownAllReduce(TileRTModule):
         weights_dict: dict[str, torch.Tensor],
         key_prefix: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Device sharding.
-
-        Args:
-            weights_dict: Dictionary of weights.
-            key_prefix: Key prefix.
-        Returns:
-            Tuple of weights.
-        """
+        """Device sharding."""
         down_proj_weight_key = f"{key_prefix}.down_proj.weight"
         down_proj_scale_key = f"{key_prefix}.down_proj.weight_scale_inv"
         down_proj_weight = weights_dict[down_proj_weight_key]
@@ -216,13 +200,7 @@ class DownAllReduce(TileRTModule):
         key_prefix: str,
         device_id: int = 0,
     ) -> None:
-        """
-        Initialize the reference weights.
-
-        Args:
-            state_dict: State dictionary.
-            device_id: Device ID.
-        """
+        """Initialize the reference weights."""
         sharded_list = self.device_sharding(state_dict, key_prefix)
 
         down_weights = sharded_list[0][device_id]
@@ -235,25 +213,19 @@ class DownAllReduce(TileRTModule):
         self.ref_down = torch.stack(down_list, dim=0)
 
     def init_tilert_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
-        """
-        Initialize the tilert weights.
-
-        Args:
-            state_dict: State dictionary.
-        """
+        """Initialize the tilert weights."""
         assert self.algorithm is not None, "Algorithm is not set"
+        converter_algorithm = (
+            DownAllReduceAlgorithm.BF16MMA
+            if self.algorithm == DownAllReduceAlgorithm.BF16MMA_V2
+            else self.algorithm
+        )
         self.tilert_weights, self.tilert_scales = DownAllReduceWeightsConverter(
             self.model_args, self.num_devices
-        ).dispatch(self.algorithm, [state_dict[alias] for alias in self.tensor_alias])
+        ).dispatch(converter_algorithm, [state_dict[alias] for alias in self.tensor_alias])
 
     def init_tilert_vars(self, batch_size: int, seq_len: int, device_id: int = 0) -> None:
-        """
-        Initialize the tilert variables.
-
-        Args:
-            batch_size: Batch size.
-            seq_len: Sequence length.
-        """
+        """Initialize the tilert variables."""
         self.hidden_out = torch.zeros(
             (batch_size, seq_len, self.dim),
             dtype=torch.bfloat16,
@@ -262,8 +234,10 @@ class DownAllReduce(TileRTModule):
         self.profile_logs = get_profile_log_tensor(device=f"cuda:{device_id}")
         self.is_init = True
 
-    def init_random_weights(self, device_id: int = 0) -> None:
+    def init_random_weights(self, device_id: int | None = None) -> None:
         """Initialize the random weights."""
+        if device_id is None:
+            device_id = self.device_id
         scale_dtype = torch.float32 if self.arch_name == "glm_5" else torch.bfloat16
         down_weights = torch.randn(
             self.dim, self.inter_dim, dtype=torch.bfloat16, device=f"cuda:{device_id}"
@@ -292,15 +266,7 @@ class DownAllReduce(TileRTModule):
         self,
         vec_in: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Forward pass for the down-project module.
-
-        Args:
-            vec_in: Input vector.
-
-        Returns:
-            Output tensor.
-        """
+        """Forward pass for the down-project module."""
         assert self.ref_down is not None
         bsz = vec_in.shape[0]
         assert bsz == 1

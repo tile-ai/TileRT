@@ -1,4 +1,4 @@
-"""RmsnormProjqWqb operation module."""
+"""RmsnormProjqWqb operation module (Device Group B, TP7)."""
 
 import math
 from dataclasses import dataclass
@@ -47,15 +47,11 @@ class RmsnormProjqWqbAlgorithm(Enum):
     """RmsnormProjqWqb algorithm."""
 
     FP16MMA = "fp16mma"
+    BF16MMA = "bf16mma"
 
 
 class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
-    """Weights converter for RmsnormProjqWqb.
-
-    Supports configurations where n_heads is not evenly divisible by
-    num_devices; in that case n_local_heads is padded and padded head
-    weight rows are zero-filled.
-    """
+    """Weights converter for RmsnormProjqWqb."""
 
     kBf16NumCtas = 80
     kGemvPageSize = 8
@@ -83,9 +79,12 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
         self.qk_dim = self.qk_head_dim * self.n_local_heads
         self.qk_qdim = self.qk_dim // self.block_size
 
-        assert self.qk_dim % (self.kBf16NumCtas * self.kGemvPageSize) == 0, (
-            f"qk_dim ({self.qk_dim}) must be divisible by "
-            f"kBf16NumCtas * kGemvPageSize ({self.kBf16NumCtas * self.kGemvPageSize})"
+        kRowsPerCta = 32
+        qk_nope_dim = self.qk_nope_head_dim * self.n_local_heads
+        qk_pe_dim = self.qk_rope_head_dim * self.n_local_heads
+        assert qk_nope_dim % kRowsPerCta == 0 and qk_pe_dim % kRowsPerCta == 0, (
+            f"qk_nope_dim ({qk_nope_dim}) and qk_pe_dim ({qk_pe_dim}) must each "
+            f"be divisible by rows_per_cta ({kRowsPerCta})"
         )
         assert self.qk_dim % self.block_size == 0, (
             f"qk_dim ({self.qk_dim}) must be divisible by block_size ({self.block_size}) "
@@ -94,7 +93,6 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
 
     @classmethod
     def _compute_n_local_heads(cls, n_total_heads: int, num_devices: int, qk_head_dim: int) -> int:
-        """Compute padded n_local_heads per device."""
         if n_total_heads % num_devices == 0:
             return n_total_heads // num_devices
 
@@ -114,22 +112,6 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
         qk_head_dim: int,
         block_size: int,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Redistribute heads across devices with padding.
-
-        Args:
-            wq_b_full: [n_total_heads * qk_head_dim, q_lora_dim] full weight.
-            wq_b_scale_full: [n_total_heads * qk_head_dim // block_size, q_lora_qdim] full scale.
-            n_total_heads: Total number of heads (e.g. 128).
-            n_local_heads: Target heads per GPU (padded, e.g. 20).
-            num_devices: Number of devices (e.g. 7).
-            qk_head_dim: Head dimension (e.g. 192).
-            block_size: Quantization block size (e.g. 128).
-
-        Returns:
-            Lists of per-device (wq_b, wq_b_scale) with shape
-            [n_local_heads * qk_head_dim, q_lora_dim] and
-            [n_local_heads * qk_head_dim // block_size, q_lora_qdim].
-        """
         total_rows = n_total_heads * qk_head_dim
         rows_per_dev = n_local_heads * qk_head_dim
         scale_rows_per_dev = rows_per_dev // block_size
@@ -185,7 +167,6 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
     def _swizzle_mma_16x16_for_pages(
         mat_in: torch.Tensor, q_lora_dim: int, pages: int
     ) -> torch.Tensor:
-        """Swizzle a 16xK matrix for the paged weight layout (K divisible by 16)."""
         assert mat_in.shape[-2] == 16 and mat_in.shape[-1] == q_lora_dim
         k_per_page = q_lora_dim // pages
         n_k_tiles = k_per_page // 16
@@ -201,7 +182,6 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
         wq_b_scales_raw: torch.Tensor,
         rmsnorm_gamma: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert common weights to the packed TileRT FP16 layout."""
         pages = 2
         rows_per_cta = 32
 
@@ -275,10 +255,14 @@ class RmsnormProjqWqbWeightsConverter(TilertWeightsConverter):
         tilert_gamma = rmsnorm_gamma.float().detach().clone()
         return tilert_wqb, tilert_wqb_scales, tilert_gamma
 
+    def convert_to_bf16mma(
+        self, weights: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.convert_to_fp16mma(weights)
+
     def convert_to_fp16mma(
         self, weights: list[torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Convert common-format weights to TileRT FP16 MMA layout."""
         with torch.inference_mode():
             wq_b, wq_b_scale, q_norm_weight = weights
             return self._common_to_tilert_fp16mma(wq_b, wq_b_scale, q_norm_weight)
@@ -325,11 +309,17 @@ class RmsnormProjqWqbTilertWeightsAlias:
 
 
 class RmsnormProjqWqb(TileRTModule):
-    """RmsnormProjqWqb module: RMSNorm + Q projection (wq_b only)."""
+    """RmsnormProjqWqb module: RMSNorm + Q projection (wq_b only, TP7)."""
 
     _SUPPORTED_ALGORITHMS = {
-        "deepseek_v3_2": [RmsnormProjqWqbAlgorithm.FP16MMA],
-        "glm_5": [RmsnormProjqWqbAlgorithm.FP16MMA],
+        "deepseek_v3_2": [
+            RmsnormProjqWqbAlgorithm.FP16MMA,
+            RmsnormProjqWqbAlgorithm.BF16MMA,
+        ],
+        "glm_5": [
+            RmsnormProjqWqbAlgorithm.FP16MMA,
+            RmsnormProjqWqbAlgorithm.BF16MMA,
+        ],
     }
 
     def __init__(
@@ -384,7 +374,7 @@ class RmsnormProjqWqb(TileRTModule):
         return [self.tilert_q_norm_weight, self.tilert_wq_b, self.tilert_wq_b_scales]
 
     def device_sharding(self, weights_map: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Redistribute heads across devices with padding."""
+        """Redistribute 128 heads into 7 GPUs × 20 slots with padding."""
         gamma = weights_map[self.ref_weights_alias.rmsnorm_gamma][None, ...].repeat(
             self.num_devices, 1
         )
@@ -489,7 +479,7 @@ class RmsnormProjqWqb(TileRTModule):
         assert self.ref_wq_b is not None
 
         bsz, seqlen, _ = q.shape
-        if bsz != 1 or seqlen not in [1, 2, 4]:
+        if bsz != 1 or seqlen not in [1, 2, 4, 8]:
             raise ValueError(f"Invalid batch size or sequence length: bsz={bsz}, seqlen={seqlen}")
 
         qr = torch.nn.functional.rms_norm(q.float(), [q.size(-1)], self.ref_q_norm, self.eps).to(
@@ -510,7 +500,7 @@ class RmsnormProjqWqb(TileRTModule):
         assert self.profile_logs is not None
 
         bsz, seqlen, _ = q.shape
-        if bsz != 1 or seqlen not in [1, 2, 4]:
+        if bsz != 1 or seqlen not in [1, 2, 4, 8]:
             raise ValueError(f"Invalid batch size or sequence length: bsz={bsz}, seqlen={seqlen}")
 
         assert self.algorithm is not None, "Algorithm is not set"
