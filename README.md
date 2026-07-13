@@ -20,7 +20,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🔀 **2026-07-13 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce **PD (prefill–decode) disaggregation** — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5 and DeepSeek-V3.2.
+- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce **PD (prefill–decode) disaggregation** — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5 and DeepSeek-V3.2.
 
 - 💥 **2026-06-08 · [Breaking 1000 TPS on a 1T Model](https://www.tilert.ai/blog/breaking-1000-tps.html)**. In collaboration with [Xiaomi MiMo](https://mimo.xiaomi.com/blog/mimo-tilert-1000tps), TileRT pushes [**MiMo-V2.5-Pro-UltraSpeed**](https://platform.xiaomimimo.com/docs/en-US/model-intro/mimo-v2.5-pro-ultraspeed) past **1000 tokens/s** on a **1-trillion-parameter** model through extreme model–system co-design — a first without custom silicon, all on a single 8-GPU node.
 
