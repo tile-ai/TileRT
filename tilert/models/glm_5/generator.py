@@ -471,9 +471,11 @@ class GLM5Generator:
                 kv_src = kv[:cache_len].to(f"cuda:{device_id}")
                 pe_src = pe[:cache_len].to(f"cuda:{device_id}")
 
-                caches[base_idx + 0][0, start_pos:end_pos, :].copy_(ki_src)
-                caches[base_idx + 1][0, start_pos:end_pos, :].copy_(kv_src)
-                caches[base_idx + 2][0, start_pos:end_pos, :].copy_(pe_src)
+                for _off, _src in ((0, ki_src), (1, kv_src), (2, pe_src)):
+                    _dst = caches[base_idx + _off]
+                    if _dst.size(1) < end_pos:
+                        continue
+                    _dst[0, start_pos:end_pos, :].copy_(_src)
 
             torch.cuda.synchronize(device_id)
 
