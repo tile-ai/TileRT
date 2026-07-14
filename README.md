@@ -20,7 +20,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce **PD (prefill–decode) disaggregation** — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5 and DeepSeek-V3.2.
+- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce **PD (prefill–decode) disaggregation** — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5/5.1 and DeepSeek-V3.2.
 
 - 💥 **2026-06-08 · [Breaking 1000 TPS on a 1T Model](https://www.tilert.ai/blog/breaking-1000-tps.html)**. In collaboration with [Xiaomi MiMo](https://mimo.xiaomi.com/blog/mimo-tilert-1000tps), TileRT pushes [**MiMo-V2.5-Pro-UltraSpeed**](https://platform.xiaomimimo.com/docs/en-US/model-intro/mimo-v2.5-pro-ultraspeed) past **1000 tokens/s** on a **1-trillion-parameter** model through extreme model–system co-design — a first without custom silicon, all on a single 8-GPU node.
 
@@ -145,7 +145,7 @@ python -m tilert.models.preprocess.weight_converter \
   --save_dir "/path/to/DeepSeek-V3.2-TileRT"
 ```
 
-For **GLM-5**:
+For **GLM-5/5.1**:
 
 ```bash
 python -m tilert.models.preprocess.weight_converter \
@@ -315,11 +315,11 @@ TileRT can run as the **decode engine behind a vLLM prefill**, integrated throug
 **Prerequisites**
 
 - Convert the model weights for TileRT decode (see [Step 2](#step-2-shard-weights-with-weight_converter)).
-- On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5 / DeepSeek-V3.2 (DSA) model and the `fp8_ds_mla` KV-cache dtype. Install `tilert` in the same environment so the connector plugin is importable.
+- On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5/5.1 / DeepSeek-V3.2 (DSA) model and the `fp8_ds_mla` KV-cache dtype. Install `tilert` in the same environment so the connector plugin is importable.
 - **The KV-cache dtype must match on both ends.** These examples use fp8: `--kv-cache-dtype fp8_ds_mla` on the vLLM prefill and `--kv-cache-dtype fp8` on the TileRT decode (a mismatch is rejected at the connector handshake).
 - The examples use the **NIXL** transfer engine. On multi-NIC hosts, pin NIXL to the RDMA NICs via `UCX_NET_DEVICES` (otherwise UCX may pick the wrong interface). Mooncake is also supported (`--transport mooncake` on the decode, `"tilert_transport": "mooncake"` on the prefill).
 
-Commands below use GLM-5. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`.
+Commands below use GLM-5/5.1. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`.
 
 ### Topology A: vLLM prefill → TileRT decode
 
@@ -329,7 +329,7 @@ Three processes — a TileRT decode server, a stock vLLM prefill, and an OpenAI-
 # 1) TileRT decode node
 python -m tilert.pd_vllm.decode_server \
     --engine tilert --model glm5 \
-    --model-weights-dir /path/to/GLM-5-FP8-TileRT \
+    --model-weights-dir /path/to/GLM-5.1-FP8-TileRT \
     --with-mtp --max-seq-len 202752 \
     --kv-cache-dtype fp8 --transport nixl \
     --ctrl-port 5556 --http-port 5557
@@ -338,7 +338,7 @@ python -m tilert.pd_vllm.decode_server \
 #    The MTP speculative config is required: the prefill populates the
 #    draft-layer KV that decode-side speculation resumes from.
 export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...   # pin NIXL to the RDMA NICs (multi-NIC hosts)
-vllm serve /path/to/GLM-5-FP8 \
+vllm serve /path/to/GLM-5.1-FP8 \
     --served-model-name glm5 --port 8000 \
     --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
     --return-tokens-as-token-ids --gpu-memory-utilization 0.75 \
@@ -357,7 +357,7 @@ vllm serve /path/to/GLM-5-FP8 \
 python -m tilert.pd_vllm.pd_router \
     --vllm-url http://<PREFILL_IP>:8000 \
     --decode <TILERT_DECODE_IP>:5556:5557 \
-    --model-path /path/to/GLM-5-FP8 \
+    --model-path /path/to/GLM-5.1-FP8 \
     --parser glm47 --port 23333
 ```
 
@@ -370,13 +370,13 @@ One prefill pool feeds two decode pools side by side, composed under vLLM's `Mul
 ```bash
 # 1) TileRT decode node (identical to Topology A)
 python -m tilert.pd_vllm.decode_server --engine tilert --model glm5 \
-    --model-weights-dir /path/to/GLM-5-FP8-TileRT --with-mtp \
+    --model-weights-dir /path/to/GLM-5.1-FP8-TileRT --with-mtp \
     --max-seq-len 202752 --kv-cache-dtype fp8 --transport nixl \
     --ctrl-port 5556 --http-port 5557
 
 # 2) Native vLLM decode node — vLLM's standard disaggregation (NixlConnector consumer)
 export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...
-vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8001 \
+vllm serve /path/to/GLM-5.1-FP8 --served-model-name glm5 --port 8001 \
     --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
     --return-tokens-as-token-ids --kv-cache-dtype fp8_ds_mla \
     --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}' \
@@ -384,7 +384,7 @@ vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8001 \
 
 # 3) Shared vLLM prefill — MultiConnector[ NixlConnector + TileRTConnector ]
 export UCX_NET_DEVICES=mlx5_1:1,mlx5_2:1,...
-vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8000 \
+vllm serve /path/to/GLM-5.1-FP8 --served-model-name glm5 --port 8000 \
     --tensor-parallel-size 8 --enforce-eager --trust-remote-code \
     --return-tokens-as-token-ids --gpu-memory-utilization 0.75 \
     --kv-cache-dtype fp8_ds_mla \
@@ -403,7 +403,7 @@ vllm serve /path/to/GLM-5-FP8 --served-model-name glm5 --port 8000 \
 
 # 4a) TileRT router — latency-critical traffic → TileRT pool
 python -m tilert.pd_vllm.pd_router --vllm-url http://<PREFILL_IP>:8000 \
-    --decode <TILERT_DECODE_IP>:5556:5557 --model-path /path/to/GLM-5-FP8 \
+    --decode <TILERT_DECODE_IP>:5556:5557 --model-path /path/to/GLM-5.1-FP8 \
     --parser glm47 --port 23333
 
 # 4b) General traffic → native vLLM decode pool, via vLLM's standard NixlConnector
