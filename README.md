@@ -70,7 +70,7 @@ ______________________________________________________________________
 
 ### Build environment of the v0.1.5 wheel
 
-The official `tilert==0.1.5` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
+The official `tilert==0.1.5.post1` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
 
 | Component        | Pinned version                                      |
 | ---------------- | --------------------------------------------------- |
@@ -106,18 +106,18 @@ docker run --rm -it --gpus all --ipc=host \
     ghcr.io/tile-ai/tilert:cu132-latest
 
 # Inside the container — install from PyPI:
-pip install tilert==0.1.5
+pip install tilert==0.1.5.post1
 
 # Or pin the exact wheel from the GitHub Release page directly
 # (same artifact, useful when PyPI is unreachable):
-pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5/tilert-0.1.5-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5/tilert-0.1.5.post1-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
 
 Verify the install:
 
 ```bash
 python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__, '/ cuda', torch.version.cuda)"
-# Expected: tilert 0.1.5 / torch 2.11.0+cu130 / cuda 13.0
+# Expected: tilert 0.1.5.post1 / torch 2.11.0+cu130 / cuda 13.0
 ```
 
 Proceed to [Getting Started](#getting-started) to download and convert model weights.
