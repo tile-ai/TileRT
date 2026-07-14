@@ -1,5 +1,4 @@
-"""PD decode server (W6): HTTP orchestration around receive -> convert ->
-inject -> decode.
+"""PD decode server (W6): HTTP orchestration around receive -> convert -> inject -> decode.
 
 Internal token-level API (the client-facing OpenAI layer lives in pd_router /
 a later serving layer):
@@ -15,11 +14,14 @@ should make that unreachable).
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import queue as queue_mod
+import socket
 import threading
 import time
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
@@ -43,7 +45,7 @@ class DecodeBody(BaseModel):
 def build_app(server: ReceiveServer, engine) -> FastAPI:
     app = FastAPI()
     lock = threading.Lock()
-    state = {"current_rid": None}
+    state: dict[str, Any] = {"current_rid": None}
 
     @app.get("/health")
     def health():
@@ -52,8 +54,7 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
     @app.get("/decode_status")
     def decode_status():
         busy = lock.locked()
-        return {"status": "busy" if busy else "idle",
-                "current_rid": state["current_rid"]}
+        return {"status": "busy" if busy else "idle", "current_rid": state["current_rid"]}
 
     @app.post("/pd/cancel")
     def pd_cancel(body: dict):
@@ -69,9 +70,10 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
             ev.set()
             logger.info("cancel requested for %s", rid)
             return {"cancelled": rid}
-        return JSONResponse({"error": "no matching in-flight request",
-                             "current_rid": state["current_rid"]},
-                            status_code=404)
+        return JSONResponse(
+            {"error": "no matching in-flight request", "current_rid": state["current_rid"]},
+            status_code=404,
+        )
 
     def _cleanup():
         try:
@@ -84,16 +86,20 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
         lock.release()
 
     def _log_reqstat(body, req, n_tokens, timing):
-        logger.info("REQSTAT rid=%s seq=%d completion=%d %s",
-                    body.rid, req.seq_len, n_tokens,
-                    " ".join(f"{k}={v}" for k, v in timing.items()))
+        logger.info(
+            "REQSTAT rid=%s seq=%d completion=%d %s",
+            body.rid,
+            req.seq_len,
+            n_tokens,
+            " ".join(f"{k}={v}" for k, v in timing.items()),
+        )
 
     @app.post("/pd/decode")
     def pd_decode(body: DecodeBody):
         if not lock.acquire(blocking=False):
             return JSONResponse(
-                {"error": "busy", "current_rid": state["current_rid"]},
-                status_code=429)
+                {"error": "busy", "current_rid": state["current_rid"]}, status_code=429
+            )
         state["current_rid"] = body.rid
         t0 = time.time()
         # phase 1: wire wait + convert + inject (common to both modes)
@@ -104,33 +110,32 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
             deadline = time.time() + body.timeout_s
             while time.time() < deadline:
                 try:
-                    cand = server.completed.get(
-                        timeout=max(0.1, deadline - time.time()))
+                    cand = server.completed.get(timeout=max(0.1, deadline - time.time()))
                 except queue_mod.Empty:
                     break
                 if cand.rid == body.rid:
                     req = cand
                     break
-                logger.warning("dropping unmatched request %s "
-                               "(waiting for %s)", cand.rid, body.rid)
+                logger.warning(
+                    "dropping unmatched request %s " "(waiting for %s)", cand.rid, body.rid
+                )
                 server.release()
             if req is None:
                 _cleanup()
                 return JSONResponse(
-                    {"error": "kv_transfer_timeout", "rid": body.rid},
-                    status_code=504)
+                    {"error": "kv_transfer_timeout", "rid": body.rid}, status_code=504
+                )
             t_recv = time.time()
             conv = server.profile.convert(
-                server.buffer, server.base_ptr, server.max_seq_len,
-                req, server.profile.num_ranks)
+                server.buffer, server.base_ptr, server.max_seq_len, req, server.profile.num_ranks
+            )
             t_conv = time.time()
             engine.inject(conv)
             t_inj = time.time()
         except Exception as e:
             logger.exception("prepare failed for %s", body.rid)
             _cleanup()
-            return JSONResponse({"error": str(e), "rid": body.rid},
-                                status_code=500)
+            return JSONResponse({"error": str(e), "rid": body.rid}, status_code=500)
 
         pre_timing = {
             "wire_wait": round(1000 * (t_recv - t0), 1),
@@ -150,16 +155,21 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
                     sampling=body.sampling,
                     cancel_event=cancel,
                 )
-                timing = {**pre_timing,
-                          "decode": round(1000 * (time.time() - t_inj), 1),
-                          **getattr(engine, "last_stats", {})}
+                timing = {
+                    **pre_timing,
+                    "decode": round(1000 * (time.time() - t_inj), 1),
+                    **getattr(engine, "last_stats", {}),
+                }
                 _log_reqstat(body, req, len(tokens), timing)
-                return {"rid": body.rid, "token_ids": tokens,
-                        "seq_len": req.seq_len, "timing_ms": timing}
+                return {
+                    "rid": body.rid,
+                    "token_ids": tokens,
+                    "seq_len": req.seq_len,
+                    "timing_ms": timing,
+                }
             except Exception as e:
                 logger.exception("decode failed for %s", body.rid)
-                return JSONResponse({"error": str(e), "rid": body.rid},
-                                    status_code=500)
+                return JSONResponse({"error": str(e), "rid": body.rid}, status_code=500)
             finally:
                 _cleanup()
 
@@ -218,22 +228,28 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
                     if done_msg is None:
                         if drained:
                             last_activity = time.time()
-                        elif time.time() - last_activity > 600:
+                        elif time.time() - last_activity > 600:  # noqa: R505 (exclusive branches)
                             yield json.dumps({"error": "decode stalled"}) + "\n"
                             return
                         else:
                             await asyncio.sleep(0.005)
                 kind, payload = done_msg
                 if kind == "done":
-                    timing = {**pre_timing,
-                              "decode": round(1000 * (time.time() - t_inj), 1),
-                              **getattr(engine, "last_stats", {})}
+                    timing = {
+                        **pre_timing,
+                        "decode": round(1000 * (time.time() - t_inj), 1),
+                        **getattr(engine, "last_stats", {}),
+                    }
                     _log_reqstat(body, req, len(payload), timing)
-                    yield json.dumps({
-                        "done": True, "n": len(payload),
-                        "seq_len": req.seq_len,
-                        "finish_reason": timing.get("finish_reason", "stop"),
-                        "timing_ms": timing}) + "\n"
+                    yield json.dumps(
+                        {
+                            "done": True,
+                            "n": len(payload),
+                            "seq_len": req.seq_len,
+                            "finish_reason": timing.get("finish_reason", "stop"),
+                            "timing_ms": timing,
+                        }
+                    ) + "\n"
                 else:
                     yield json.dumps({"error": payload}) + "\n"
             finally:
@@ -244,18 +260,16 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
                 with anyio.CancelScope(shield=True):
                     await run_in_threadpool(worker.join, 120)
                 if worker.is_alive():
-                    logger.error("decode worker failed to stop for %s",
-                                 body.rid)
+                    logger.error("decode worker failed to stop for %s", body.rid)
                 _cleanup()
 
         return StreamingResponse(_gen(), media_type="application/x-ndjson")
 
-    return app
+    return app  # noqa: R504 (assembled across the function)
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(name)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=["stub", "tilert"], default="stub")
     ap.add_argument("--model", default="glm5", help="model profile")
@@ -264,41 +278,72 @@ def main() -> None:
     ap.add_argument("--http-port", type=int, default=5557)
     ap.add_argument("--model-weights-dir", default="")
     ap.add_argument("--with-mtp", action="store_true")
-    ap.add_argument("--transport", choices=["mooncake", "nixl"],
-                    default="mooncake", help="RDMA data-plane backend "
-                    "(must match prefill's tilert_transport)")
-    ap.add_argument("--kv-cache-dtype", default="fp8_ds_mla",
-                    help="MLA cache dtype (must match vLLM prefill); "
-                         "MLA-family profiles only")
+    ap.add_argument(
+        "--transport",
+        choices=["mooncake", "nixl"],
+        default="mooncake",
+        help="RDMA data-plane backend " "(must match prefill's tilert_transport)",
+    )
+    ap.add_argument(
+        "--kv-cache-dtype",
+        default="fp8_ds_mla",
+        help="MLA cache dtype (must match vLLM prefill); " "MLA-family profiles only",
+    )
     args = ap.parse_args()
 
     from tilert.pd_vllm.profiles import base as profiles
+
     profile = profiles.get_profile(args.model)
     # MLA-family profiles (glm5/dsv32) need the cache dtype to size the receive
     # buffer.
     if hasattr(profile, "configure"):
         profile.configure(args.kv_cache_dtype)
-        logger.info("profile %s MLA cache dtype = %s (layout v%d)",
-                    profile.name, args.kv_cache_dtype, profile.layout_version)
+        logger.info(
+            "profile %s MLA cache dtype = %s (layout v%d)",
+            profile.name,
+            args.kv_cache_dtype,
+            profile.layout_version,
+        )
 
     if args.engine == "stub":
         from tilert.pd_vllm.engine_iface import StubEngine
-        engine = StubEngine()
+
+        engine: Any = StubEngine()
     else:
-        logger.info("loading TileRT engine (profile=%s, weights=%s)...",
-                    profile.name, args.model_weights_dir)
+        logger.info(
+            "loading TileRT engine (profile=%s, weights=%s)...",
+            profile.name,
+            args.model_weights_dir,
+        )
         engine = profile.build_engine(
             model_weights_dir=args.model_weights_dir,
-            max_seq_len=args.max_seq_len, with_mtp=args.with_mtp,
-            ar_steps=8)
+            max_seq_len=args.max_seq_len,
+            with_mtp=args.with_mtp,
+            ar_steps=8,
+        )
         logger.info("TileRT engine ready (cache window %d)", engine.max_seq_len)
 
-    server = ReceiveServer(profile, max_seq_len=args.max_seq_len,
-                           ctrl_port=args.ctrl_port, transport=args.transport)
+    server = ReceiveServer(
+        profile, max_seq_len=args.max_seq_len, ctrl_port=args.ctrl_port, transport=args.transport
+    )
     app = build_app(server, engine)
-    logger.info("decode server on :%d (profile=%s, engine=%s, ctrl=:%d)",
-                args.http_port, profile.name, args.engine, args.ctrl_port)
-    uvicorn.run(app, host="::", port=args.http_port, log_level="warning")
+    logger.info(
+        "decode server on :%d (profile=%s, engine=%s, ctrl=:%d)",
+        args.http_port,
+        profile.name,
+        args.engine,
+        args.ctrl_port,
+    )
+    # Bind dual-stack (IPv4 + IPv6) explicitly. uvicorn's host="::" is
+    # IPv6-only under some uvicorn/OS combinations, which leaves the decode
+    # HTTP endpoint unreachable from an IPv4 router. Mirror the control plane
+    # (receive_server) by clearing IPV6_V6ONLY on an AF_INET6 socket.
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(("::", args.http_port))
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[sock])
 
 
 if __name__ == "__main__":

@@ -8,12 +8,13 @@ from tilert.pd_vllm.profiles.mla_nsa import (
     MlaNsaProfile,
 )
 
-NUM_LAYERS = 62           # 61 main + 1 MTP draft (HF: 61 hidden + 1 nextn)
-LAYOUT_VERSION = 11       # dsv32 wire family (distinct from glm5's 10)
+NUM_LAYERS = 62  # 61 main + 1 MTP draft (HF: 61 hidden + 1 nextn)
+LAYOUT_VERSION = 11  # dsv32 wire family (distinct from glm5's 10)
 
 
 def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):
     import tilert
+
     if hasattr(tilert, "load_backend"):
         tilert.load_backend("deepseek_v3_2")  # multi-backend builds only
     from tilert.models.deepseek_v3_2.generator import DSAv32Generator
@@ -30,6 +31,11 @@ def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):
     return MlaNsaEngineAdapter(gen, with_mtp)
 
 
-base.register(MlaNsaProfile(
-    name="dsv32", num_layers=NUM_LAYERS, layout_version=LAYOUT_VERSION,
-    engine_factory=_build_engine))
+base.register(
+    MlaNsaProfile(
+        name="dsv32",
+        num_layers=NUM_LAYERS,
+        layout_version=LAYOUT_VERSION,
+        engine_factory=_build_engine,
+    )
+)

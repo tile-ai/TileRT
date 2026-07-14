@@ -14,7 +14,6 @@ Runs in the ROUTER environment only — that env must have vllm installed
 node never imports vllm.
 """
 
-import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -24,14 +23,14 @@ logger = logging.getLogger("pd_vllm.oai_parser")
 
 @dataclass
 class ToolCall:
-    id: str
+    call_id: str
     name: str
     arguments: str  # JSON string (OpenAI convention)
 
     def to_openai(self, index: int) -> dict:
         return {
             "index": index,
-            "id": self.id,
+            "id": self.call_id,
             "type": "function",
             "function": {"name": self.name, "arguments": self.arguments},
         }
@@ -53,21 +52,21 @@ def _new_call_id() -> str:
 # builder + a `_*_arg_converter(raw, partial)`); the adapter picks the engine
 # by family name.
 _FAMILIES = {
-    "glm47": ("vllm.parser.glm47_moe", "glm47_moe_config",
-              "_glm47_arg_converter"),
+    "glm47": ("vllm.parser.glm47_moe", "glm47_moe_config", "_glm47_arg_converter"),
 }
 
 
 def make_parser(family: str, tokenizer, thinking: bool = True) -> "OaiParser":
     if family not in _FAMILIES:
-        raise KeyError(f"unknown parser family {family!r}; "
-                       f"known: {sorted(_FAMILIES)}")
+        raise KeyError(f"unknown parser family {family!r}; " f"known: {sorted(_FAMILIES)}")
     return OaiParser(family, tokenizer, thinking)
 
 
 class OaiParser:
-    """Family-parameterized parser; one instance per model, ``stream()`` per
-    request. Family is a vllm.parser engine (glm47)."""
+    """Family-parameterized parser; one instance per model, ``stream()`` per request.
+
+    Family is a vllm.parser engine (glm47).
+    """
 
     def __init__(self, family: str, tokenizer, thinking: bool = True):
         import importlib
@@ -191,12 +190,17 @@ class OaiStream:
             return None
         self._emitted.add(index)
         args = self._p._convert("".join(s["args"]), partial)
-        return {"kind": "tool", "index": index, "id": _new_call_id(),
-                "name": name, "arguments": args}
+        return {
+            "kind": "tool",
+            "index": index,
+            "id": _new_call_id(),
+            "name": name,
+            "arguments": args,
+        }
 
 
 class IncrementalDetok:
-    """Incremental token→text for byte-level BPE tokenizers.
+    r"""Incremental token→text for byte-level BPE tokenizers.
 
     Decodes a bounded trailing window; holds output while the window ends in
     a partial multi-byte sequence (\\ufffd). Window folding is safe for
@@ -218,9 +222,9 @@ class IncrementalDetok:
         text = self._tok.decode(self._ids, skip_special_tokens=False)
         if text.endswith("�"):
             return ""
-        delta = text[self._emitted:]
+        delta = text[self._emitted :]
         self._emitted = len(text)
         if len(self._ids) > self._FOLD:
             self._ids = []
             self._emitted = 0
-        return delta
+        return delta  # noqa: R504 (self._emitted mutated after delta is computed)

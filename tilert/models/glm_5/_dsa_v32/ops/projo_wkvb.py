@@ -98,9 +98,7 @@ class ProjoWKVbWeightsConverter(TilertWeightsConverter):
                 scales_per_cta = wkv_b_b_scales.repeat_interleave(ctas_per_scale_row, dim=1)
                 scales_per_cta = scales_per_cta.reshape(num_ctas, n_scale_k)
             else:
-                scales_per_cta = wkv_b_b_scales.squeeze(1).repeat_interleave(
-                    ctas_per_head, dim=0
-                )
+                scales_per_cta = wkv_b_b_scales.squeeze(1).repeat_interleave(ctas_per_head, dim=0)
 
             scale_dtype = torch.float32
             scales_per_cta = scales_per_cta.to(scale_dtype)

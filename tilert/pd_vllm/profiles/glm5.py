@@ -13,12 +13,13 @@ from tilert.pd_vllm.profiles.mla_nsa import (
     MlaNsaProfile,
 )
 
-NUM_LAYERS = 79           # 78 main + 1 MTP draft
-LAYOUT_VERSION = 10       # glm5 wire family
+NUM_LAYERS = 79  # 78 main + 1 MTP draft
+LAYOUT_VERSION = 10  # glm5 wire family
 
 
 def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):
     import tilert
+
     # multi-backend builds (tilert>=0.1.x) load the per-model .so on demand;
     # single-backend builds auto-register on import and lack load_backend.
     if hasattr(tilert, "load_backend"):
@@ -38,6 +39,11 @@ def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):
     return MlaNsaEngineAdapter(gen, with_mtp)
 
 
-base.register(MlaNsaProfile(
-    name="glm5", num_layers=NUM_LAYERS, layout_version=LAYOUT_VERSION,
-    engine_factory=_build_engine))
+base.register(
+    MlaNsaProfile(
+        name="glm5",
+        num_layers=NUM_LAYERS,
+        layout_version=LAYOUT_VERSION,
+        engine_factory=_build_engine,
+    )
+)

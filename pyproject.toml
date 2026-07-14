@@ -111,6 +111,16 @@ ignore_missing_imports = true
 exclude = ["3rd-party/"]
 explicit_package_bases = true
 
+# pd_vllm is glue over vLLM's connector API; its interface methods take
+# ``Any``-typed params by contract, so full def-level annotation is low value.
+# Relax annotation-completeness there, but keep real type checks (arg-type,
+# union-attr, etc.) on so genuine mistakes still surface.
+[[tool.mypy.overrides]]
+module = "tilert.pd_vllm.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+warn_return_any = false
+
 [tool.bandit]
 exclude_dirs = ["tests", "3rd-party"]
 skips = ["B101", "B311", "B404", "B603", "B607"]

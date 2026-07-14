@@ -5,7 +5,8 @@ built by the active model profile (``profile.build_engine(...)``).
 ``StubEngine`` runs the whole serving path with no GPU / no tilert.
 """
 
-from typing import Any, Callable, Protocol
+from collections.abc import Callable
+from typing import Any, Protocol
 
 
 class PDEngine(Protocol):
@@ -20,10 +21,12 @@ class PDEngine(Protocol):
         on_token: Callable[[int], None] | None = None,
         cancel_event=None,
     ) -> list[int]:
-        """AR/MTP decode from first_token_id; returns completion ids
-        (incl. first_token_id, excl. stop token). on_token never fires for
-        stop tokens; cancel_event stops early; last_stats['finish_reason'] is
-        'stop' | 'length' | 'cancelled'."""
+        """AR/MTP decode from first_token_id; returns completion ids.
+
+        Includes first_token_id, excludes the stop token. on_token never fires
+        for stop tokens; cancel_event stops early; last_stats['finish_reason']
+        is 'stop' | 'length' | 'cancelled'.
+        """
 
     def reset(self) -> None:
         """Release per-request state."""
@@ -40,8 +43,7 @@ class StubEngine:
     def inject(self, req: Any) -> None:
         self.injected = req
 
-    def decode(self, first_token_id, max_tokens, sampling, on_token=None,
-               cancel_event=None):
+    def decode(self, first_token_id, max_tokens, sampling, on_token=None, cancel_event=None):
         out = ([int(first_token_id)] + list(self._fixed))[:max_tokens]
         if on_token:
             for t in out:

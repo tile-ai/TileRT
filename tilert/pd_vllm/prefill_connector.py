@@ -59,6 +59,7 @@ class TileRTMetadata(KVConnectorMetadata):
 @dataclass
 class _Pending:
     """Scheduler-side chunked-prefill accumulation."""
+
     req_id: str
     prompt_token_ids: list
     total_tokens: int
@@ -75,8 +76,7 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         self._default_host = extra.get("tilert_host")
         self._default_port = int(extra.get("tilert_ctrl_port", 5556))
         self._sync_send = bool(extra.get("tilert_sync_send", False))
-        self._max_seq = int(extra.get("tilert_max_seq_len",
-                                      vllm_config.model_config.max_model_len))
+        self._max_seq = int(extra.get("tilert_max_seq_len", vllm_config.model_config.max_model_len))
         self._profile = profiles.get_profile(extra.get("tilert_model", "glm5"))
         self._transport_name = extra.get("tilert_transport", "mooncake")
 
@@ -85,16 +85,21 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
 
         # worker-side (lazy)
         self._kv_caches: dict = {}
-        self._reg = None                  # profile registration (layer map)
+        self._reg = None  # profile registration (layer map)
         self._tp_rank: int | None = None
         self._transport = None
         self._staging = None
         self._send_q: queue.Queue = queue.Queue()
         self._sender_thread: threading.Thread | None = None
 
-        logger.info("TileRTConnector: role=%s profile=%s target=%s:%s sync=%s",
-                    role, self._profile.name, self._default_host,
-                    self._default_port, self._sync_send)
+        logger.info(
+            "TileRTConnector: role=%s profile=%s target=%s:%s sync=%s",
+            role,
+            self._profile.name,
+            self._default_host,
+            self._default_port,
+            self._sync_send,
+        )
 
     # ══════════════════════ scheduler side ═════════════════════
 
@@ -137,13 +142,15 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             groups = [list(g) for g in new_req.block_ids]
             n = num_sched.get(new_req.req_id, 0)
             if new_req.num_computed_tokens + n >= len(token_ids):
-                meta.requests.append(self._emit(new_req.req_id, token_ids,
-                                                groups, params))
+                meta.requests.append(self._emit(new_req.req_id, token_ids, groups, params))
             else:
                 self._pending[new_req.req_id] = _Pending(
-                    req_id=new_req.req_id, prompt_token_ids=token_ids,
-                    total_tokens=len(token_ids), block_ids_per_group=groups,
-                    params=params)
+                    req_id=new_req.req_id,
+                    prompt_token_ids=token_ids,
+                    total_tokens=len(token_ids),
+                    block_ids_per_group=groups,
+                    params=params,
+                )
 
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(getattr(cached, "req_ids", []) or []):
@@ -157,25 +164,33 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
                         p.block_ids_per_group[gi].extend(g)
             n = num_sched.get(req_id, 0)
             if cached.num_computed_tokens[i] + n >= p.total_tokens:
-                meta.requests.append(self._emit(req_id, p.prompt_token_ids,
-                                                p.block_ids_per_group, p.params))
+                meta.requests.append(
+                    self._emit(req_id, p.prompt_token_ids, p.block_ids_per_group, p.params)
+                )
                 del self._pending[req_id]
         return meta
 
     def _emit(self, req_id, token_ids, groups, params) -> _ReqMeta:
+        host = params.get("tilert_host") or self._default_host
+        assert host is not None, "claimed a request with no tilert_host"
         m = _ReqMeta(
             req_id=req_id,
             rid=derive_rid(req_id),
             num_tokens=len(token_ids),
             last_prompt_token=int(token_ids[-1]),
             block_ids_per_group=groups,
-            tilert_host=params.get("tilert_host") or self._default_host,
-            tilert_ctrl_port=int(params.get("tilert_ctrl_port",
-                                            self._default_port)),
+            tilert_host=host,
+            tilert_ctrl_port=int(params.get("tilert_ctrl_port", self._default_port)),
             sampling=params.get("sampling"),
         )
-        logger.info("claimed %s (rid=%s, %d tokens) -> %s:%d",
-                    req_id, m.rid, m.num_tokens, m.tilert_host, m.tilert_ctrl_port)
+        logger.info(
+            "claimed %s (rid=%s, %d tokens) -> %s:%d",
+            req_id,
+            m.rid,
+            m.num_tokens,
+            m.tilert_host,
+            m.tilert_ctrl_port,
+        )
         return m
 
     def request_finished(self, request, block_ids):
@@ -197,7 +212,8 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             return
         import torch
         from vllm.distributed import get_tensor_model_parallel_rank
-        self._tp_rank = get_tensor_model_parallel_rank()
+
+        self._tp_rank = int(get_tensor_model_parallel_rank())
 
         from tilert.pd_vllm.transport import make_transport
 
@@ -212,11 +228,16 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
 
         if not self._sync_send:
             self._sender_thread = threading.Thread(
-                target=self._sender_loop, name="tilert-pd-sender", daemon=True)
+                target=self._sender_loop, name="tilert-pd-sender", daemon=True
+            )
             self._sender_thread.start()
-        logger.info("worker ready: rank=%d transport=%s staging=%.1f MB profile=%s",
-                    self._tp_rank, self._transport.name, total / 1e6,
-                    self._profile.name)
+        logger.info(
+            "worker ready: rank=%d transport=%s staging=%.1f MB profile=%s",
+            self._tp_rank,
+            self._transport.name,
+            total / 1e6,
+            self._profile.name,
+        )
 
     def start_load_kv(self, forward_context, **kwargs):
         pass
@@ -232,12 +253,14 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         if not isinstance(metadata, TileRTMetadata) or not metadata.requests:
             return
         self._ensure_worker_ready()
+        assert self._tp_rank is not None  # set by _ensure_worker_ready
         if self._tp_rank not in self._profile.sender_ranks:
             return  # this rank does not participate (e.g. replicated MLA)
         for m in metadata.requests:
             try:
                 sections = self._profile.extract(
-                    self._reg, m, self._tp_rank, self._staging, self._max_seq)
+                    self._reg, m, self._tp_rank, self._staging, self._max_seq
+                )
             except Exception:
                 logger.exception("extraction failed for %s", m.rid)
                 continue
@@ -264,6 +287,9 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         import socket as _socket
         import time as _time
 
+        # _send only runs after wait_for_save() -> _ensure_worker_ready()
+        assert self._transport is not None and self._staging is not None
+        assert self._tp_rank is not None
         m: _ReqMeta = job["meta"]
         seq = job["seq"]
         t0 = _time.time()
@@ -274,31 +300,42 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             conn.connect((m.tilert_host, m.tilert_ctrl_port))
             hello = wire.recv_msg(conn)
             assert hello.get("magic") == wire.MAGIC, f"bad hello: {hello}"
-            assert hello.get("layout_version") == self._profile.layout_version, \
-                (f"layout version mismatch: {hello.get('layout_version')} "
-                 f"vs {self._profile.layout_version}")
-            assert hello.get("transport") == self._transport.name, \
-                (f"transport mismatch: decode={hello.get('transport')} "
-                 f"vs prefill={self._transport.name}")
+            assert hello.get("layout_version") == self._profile.layout_version, (
+                f"layout version mismatch: {hello.get('layout_version')} "
+                f"vs {self._profile.layout_version}"
+            )
+            assert hello.get("transport") == self._transport.name, (
+                f"transport mismatch: decode={hello.get('transport')} "
+                f"vs prefill={self._transport.name}"
+            )
             remote_max_seq = int(hello["max_seq_len"])
-            assert seq <= remote_max_seq, \
-                f"seq {seq} exceeds decode max_seq_len {remote_max_seq}"
+            assert seq <= remote_max_seq, f"seq {seq} exceeds decode max_seq_len {remote_max_seq}"
 
-            wire.send_msg(conn, {
-                "rid": m.rid, "rank": self._tp_rank, "seq_len": seq,
-                "last_prompt_token": m.last_prompt_token,
-                "sampling": m.sampling,
-            })
+            wire.send_msg(
+                conn,
+                {
+                    "rid": m.rid,
+                    "rank": self._tp_rank,
+                    "seq_len": seq,
+                    "last_prompt_token": m.last_prompt_token,
+                    "sampling": m.sampling,
+                },
+            )
 
             base = self._staging.data_ptr()
             srcs, dsts, lens = self._profile.rdma_plan(
-                hello, job["sections"], self._tp_rank, seq, base)
+                hello, job["sections"], self._tp_rank, seq, base
+            )
             self._transport.write(hello, srcs, dsts, lens)
 
-            wire.send_msg(conn, {"done": True, "rid": m.rid,
-                                 "rank": self._tp_rank})
-            logger.info("sent %s: rank=%d seq=%d %.1f MB in %.1f ms",
-                        m.rid, self._tp_rank, seq, sum(lens) / 1e6,
-                        1000 * (_time.time() - t0))
+            wire.send_msg(conn, {"done": True, "rid": m.rid, "rank": self._tp_rank})
+            logger.info(
+                "sent %s: rank=%d seq=%d %.1f MB in %.1f ms",
+                m.rid,
+                self._tp_rank,
+                seq,
+                sum(lens) / 1e6,
+                1000 * (_time.time() - t0),
+            )
         finally:
             conn.close()

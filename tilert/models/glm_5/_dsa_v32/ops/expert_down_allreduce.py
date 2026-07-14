@@ -18,8 +18,6 @@ __all__ = [
 ]
 
 
-
-
 def expert_down_allreduce(
     vec_in: torch.Tensor,
     mat_in: torch.Tensor,
@@ -47,8 +45,6 @@ def expert_down_allreduce(
         compute_kernel_type,
         profile_logs,
     )
-
-
 
 
 class ExpertDownAllReduceAlgorithm(Enum):
@@ -278,8 +274,6 @@ class ExpertDownAllReduceWeightsConverter(TilertWeightsConverter):
             down_packed = build_down_weights_mma_natural(full_nib, full_e8, dim, moe_inter_pd)
             dummy = torch.zeros(1, dtype=torch.float32, device=device)
             return down_packed, dummy
-
-
 
 
 @dataclass

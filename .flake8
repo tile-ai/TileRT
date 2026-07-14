@@ -35,3 +35,7 @@ per-file-ignores =
     __init__.py:F401
     tests/*:D100,D101,D102,D103
     setup.py:D100,D101,D102,D103,B009
+    # pd_vllm implements vLLM connector / abstract-profile interfaces, so many
+    # method params are unused by design (U100); black collapses the ``...``
+    # interface stubs onto one line (E704).
+    tilert/pd_vllm/*:U100,E704

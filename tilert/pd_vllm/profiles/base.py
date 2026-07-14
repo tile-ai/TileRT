@@ -16,58 +16,73 @@ from typing import Any, Protocol
 class ModelProfile(Protocol):
     name: str
     num_ranks: int
-    layout_version: int
     sender_ranks: frozenset
+
+    @property
+    def layout_version(self) -> int: ...
 
     # ── receive side (decode node) ───────────────────────────────────────
     def buffer_bytes(self, max_seq_len: int) -> int:
         """Total receive-buffer size for one request slot."""
 
     def hello_layout(self, base_ptr: int, max_seq_len: int) -> dict[str, int]:
-        """Region base addresses (merged into the hello message) so the
-        sender knows where to RDMA-write each section."""
+        """Region base addresses, merged into the hello message.
 
-    def convert(self, buffer: Any, base_ptr: int, max_seq_len: int,
-                received: Any, num_devices: int) -> Any:
+        Tells the sender where to RDMA-write each section.
+        """
+
+    def convert(
+        self, buffer: Any, base_ptr: int, max_seq_len: int, received: Any, num_devices: int
+    ) -> Any:
         """Received buffer -> native per-device tensors (ConvertedRequest)."""
 
     # ── prefill side (vLLM connector worker) ─────────────────────────────
     def classify_layers(self, kv_caches: dict, kv_cache_config: Any) -> Any:
-        """Inspect registered kv_caches; return an opaque registration the
-        framework passes back to ``staging_bytes``/``extract``. Raise on an
-        unexpected layer set (e.g. missing speculative layer)."""
+        """Inspect registered kv_caches and return an opaque registration.
+
+        The framework passes it back to ``staging_bytes``/``extract``. Raise on
+        an unexpected layer set (e.g. missing speculative layer).
+        """
 
     def staging_bytes(self, reg: Any, tp_rank: int, max_seq_len: int) -> int:
         """Per-rank staging-buffer size."""
 
-    def extract(self, reg: Any, req_meta: Any, tp_rank: int,
-                staging, max_seq_len: int) -> Any:
-        """Copy this rank's KV out of the paged caches into ``staging``
-        (inside the forward window); return opaque ``sections``."""
+    def extract(self, reg: Any, req_meta: Any, tp_rank: int, staging, max_seq_len: int) -> Any:
+        """Copy this rank's KV out of the paged caches into ``staging``.
 
-    def rdma_plan(self, hello: dict, sections: Any, tp_rank: int,
-                  seq_len: int, staging_base: int) -> tuple[list, list, list]:
+        Runs inside the forward window; returns opaque ``sections``.
+        """
+
+    def rdma_plan(
+        self, hello: dict, sections: Any, tp_rank: int, seq_len: int, staging_base: int
+    ) -> tuple[list, list, list]:
         """(src_ptrs, dst_ptrs, lengths) for one mooncake batch write."""
 
     # ── engine (decode node) ─────────────────────────────────────────────
-    def build_engine(self, model_weights_dir: str, max_seq_len: int,
-                     with_mtp: bool, ar_steps: int) -> Any:
+    def build_engine(
+        self, model_weights_dir: str, max_seq_len: int, with_mtp: bool, ar_steps: int
+    ) -> Any:
         """Construct the decode engine adapter (inject/decode/reset)."""
 
 
-_REGISTRY: dict[str, "ModelProfile"] = {}
+_REGISTRY: dict[str, ModelProfile] = {}
 _ALIASES = {
-    "glm5": "glm5", "glm_5": "glm5", "glm-5": "glm5",
-    "dsv32": "dsv32", "deepseek_v3_2": "dsv32", "deepseek-v3.2": "dsv32",
-    "dsv3.2": "dsv32", "v32": "dsv32",
+    "glm5": "glm5",
+    "glm_5": "glm5",
+    "glm-5": "glm5",
+    "dsv32": "dsv32",
+    "deepseek_v3_2": "dsv32",
+    "deepseek-v3.2": "dsv32",
+    "dsv3.2": "dsv32",
+    "v32": "dsv32",
 }
 
 
-def register(profile: "ModelProfile") -> None:
+def register(profile: ModelProfile) -> None:
     _REGISTRY[profile.name] = profile
 
 
-def get_profile(name: str) -> "ModelProfile":
+def get_profile(name: str) -> ModelProfile:
     canon = _ALIASES.get(name, name)
     if canon not in _REGISTRY:
         # lazy import so a profile's heavy deps load only when selected
@@ -76,6 +91,7 @@ def get_profile(name: str) -> "ModelProfile":
         elif canon == "dsv32":
             from tilert.pd_vllm.profiles import dsv32  # noqa: F401
     if canon not in _REGISTRY:
-        raise KeyError(f"unknown model profile {name!r}; "
-                       f"accepted keys (incl. aliases): {sorted(_ALIASES)}")
+        raise KeyError(
+            f"unknown model profile {name!r}; " f"accepted keys (incl. aliases): {sorted(_ALIASES)}"
+        )
     return _REGISTRY[canon]

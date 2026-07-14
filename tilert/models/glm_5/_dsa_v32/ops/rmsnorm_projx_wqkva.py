@@ -121,9 +121,7 @@ class RMSNormProjQKVAFP8MMAWeightsConverter:
                 _bcast_block_scale(w_pe_scale, qk_rope_head_dim),
             ],
             dim=0,
-        ).clamp(
-            min=1e-12
-        )
+        ).clamp(min=1e-12)
 
         assert C.MAT_BYTES == C.SCALE_OFFSET, "Layout mismatch: scales must follow mat"
 

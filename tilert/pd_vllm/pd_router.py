@@ -1,6 +1,7 @@
-"""PD router (W6): client-facing entry that orchestrates vLLM prefill and
-TileRT decode, with OpenAI-semantics output parsing (reasoning + tool calls),
-streaming and non-streaming.
+"""PD router (W6): client-facing entry over vLLM prefill + TileRT decode.
+
+Does OpenAI-semantics output parsing (reasoning + tool calls), streaming and
+non-streaming.
 
 Flow per request (phase-1 hybrid, see design doc):
   1. pick a free decode node (in-memory busy tracking; all busy -> 429)
@@ -87,7 +88,8 @@ def first_token_from_logprobs(resp: dict, is_chat: bool) -> int:
         return int(tok.split(":", 1)[1])
     raise ValueError(
         f"cannot extract first token id from logprobs ({tok!r}); launch vLLM "
-        f"with --return-tokens-as-token-ids and request logprobs")
+        f"with --return-tokens-as-token-ids and request logprobs"
+    )
 
 
 def _thinking_enabled(body: dict) -> bool:
@@ -108,11 +110,10 @@ class RouterCtx:
             if tokenizer is None:
                 raise SystemExit("--parser requires --model-path (tokenizer)")
             from tilert.pd_vllm.oai_parser import make_parser
-            self._parsers[True] = make_parser(parser_name, tokenizer,
-                                              thinking=True)
+
+            self._parsers[True] = make_parser(parser_name, tokenizer, thinking=True)
             self._parsers[False] = self._parsers[True].with_thinking(False)
-            logger.info("parser '%s' ready (thinking variants cached)",
-                        parser_name)
+            logger.info("parser '%s' ready (thinking variants cached)", parser_name)
 
     def parser(self, thinking: bool):
         return self._parsers.get(thinking)
@@ -124,13 +125,11 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"status": "ok",
-                "decode_free": sum(1 for n in pool.nodes if not n.busy)}
+        return {"status": "ok", "decode_free": sum(1 for n in pool.nodes if not n.busy)}
 
     @app.get("/pool_status")
     def pool_status():
-        return {"nodes": [{"host": n.host, "busy": n.busy}
-                          for n in pool.nodes]}
+        return {"nodes": [{"host": n.host, "busy": n.busy} for n in pool.nodes]}
 
     # ── shared prefill step ──────────────────────────────────────────────
     def _prefill(path, body, node):
@@ -146,26 +145,22 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             "tilert_host": node.host,
             "tilert_ctrl_port": node.ctrl_port,
         }
-        r = requests.post(f"{ctx.vllm_url}{path}", json=prefill_body,
-                          timeout=600)
+        r = requests.post(f"{ctx.vllm_url}{path}", json=prefill_body, timeout=600)
         r.raise_for_status()
         return r.json()
 
     def _sampling_of(body):
-        return {k: body[k] for k in ("temperature", "top_p", "top_k")
-                if k in body}
+        return {k: body[k] for k in ("temperature", "top_p", "top_k") if k in body}
 
     def _max_tokens_of(body):
-        return int(body.get("max_tokens")
-                   or body.get("max_completion_tokens") or 256)
+        return int(body.get("max_tokens") or body.get("max_completion_tokens") or 256)
 
     # ── non-streaming ────────────────────────────────────────────────────
     def _handle(path: str, body: dict):
         is_chat = path.endswith("chat/completions")
         node = pool.acquire()
         if node is None:
-            return JSONResponse({"error": "all decode nodes busy"},
-                                status_code=429)
+            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
         t0 = time.time()
         try:
             prefill = _prefill(path, body, node)
@@ -173,12 +168,16 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             rid = derive_rid(prefill["id"])
             first_token_id = first_token_from_logprobs(prefill, is_chat)
 
-            dr = requests.post(f"{node.http_base}/pd/decode", json={
-                "rid": rid,
-                "first_token_id": first_token_id,
-                "max_tokens": _max_tokens_of(body),
-                "sampling": _sampling_of(body),
-            }, timeout=600)
+            dr = requests.post(
+                f"{node.http_base}/pd/decode",
+                json={
+                    "rid": rid,
+                    "first_token_id": first_token_id,
+                    "max_tokens": _max_tokens_of(body),
+                    "sampling": _sampling_of(body),
+                },
+                timeout=600,
+            )
             dr.raise_for_status()
             decode = dr.json()
             token_ids = decode["token_ids"]
@@ -190,44 +189,44 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             choice: dict = {"index": 0, "finish_reason": finish}
             parser = ctx.parser(_thinking_enabled(body)) if is_chat else None
             if parser is not None:
-                text = ctx.tokenizer.decode(token_ids,
-                                            skip_special_tokens=False)
+                text = ctx.tokenizer.decode(token_ids, skip_special_tokens=False)
                 parsed = parser.parse_complete(text)
                 msg = {"role": "assistant", "content": parsed.content or ""}
                 if parsed.reasoning_content:
                     msg["reasoning_content"] = parsed.reasoning_content
                 if parsed.tool_calls:
-                    msg["tool_calls"] = [c.to_openai(i) for i, c
-                                         in enumerate(parsed.tool_calls)]
+                    msg["tool_calls"] = [c.to_openai(i) for i, c in enumerate(parsed.tool_calls)]
                     choice["finish_reason"] = "tool_calls"
                 choice["message"] = msg
             else:
-                text = (ctx.tokenizer.decode(token_ids,
-                                             skip_special_tokens=True)
-                        if ctx.tokenizer else None)
+                text = (
+                    ctx.tokenizer.decode(token_ids, skip_special_tokens=True)
+                    if ctx.tokenizer
+                    else None
+                )
                 if is_chat:
                     choice["message"] = {"role": "assistant", "content": text}
                 else:
                     choice["text"] = text
                     choice["token_ids"] = token_ids
 
-            return JSONResponse({
-                "id": prefill["id"],
-                "object": ("chat.completion" if is_chat
-                           else "text_completion"),
-                "created": int(time.time()),
-                "model": prefill.get("model"),
-                "choices": [choice],
-                "usage": {
-                    "prompt_tokens": (prefill.get("usage") or {})
-                    .get("prompt_tokens"),
-                    "completion_tokens": len(token_ids),
-                },
-                "pd_timing_ms": {
-                    "prefill": round(1000 * (t_prefill - t0), 1),
-                    **timing,
-                },
-            })
+            return JSONResponse(
+                {
+                    "id": prefill["id"],
+                    "object": "chat.completion" if is_chat else "text_completion",
+                    "created": int(time.time()),
+                    "model": prefill.get("model"),
+                    "choices": [choice],
+                    "usage": {
+                        "prompt_tokens": (prefill.get("usage") or {}).get("prompt_tokens"),
+                        "completion_tokens": len(token_ids),
+                    },
+                    "pd_timing_ms": {
+                        "prefill": round(1000 * (t_prefill - t0), 1),
+                        **timing,
+                    },
+                }
+            )
         except Exception as e:
             logger.exception("pd request failed")
             return JSONResponse({"error": str(e)}, status_code=502)
@@ -240,8 +239,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
         node = pool.acquire()
         if node is None:
-            return JSONResponse({"error": "all decode nodes busy"},
-                                status_code=429)
+            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
 
         try:
             prefill = await run_in_threadpool(_prefill, path, body, node)
@@ -259,10 +257,11 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
         def _chunk(delta: dict, finish=None, usage=None) -> str:
             payload = {
-                "id": chunk_id, "object": "chat.completion.chunk",
-                "created": int(time.time()), "model": model,
-                "choices": [{"index": 0, "delta": delta,
-                             "finish_reason": finish}],
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
             }
             if usage is not None:
                 payload["usage"] = usage
@@ -273,16 +272,20 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                 return {"reasoning_content": ev["text"]}
             if ev["kind"] == "content":
                 return {"content": ev["text"]}
-            return {"tool_calls": [{
-                "index": ev["index"], "id": ev["id"], "type": "function",
-                "function": {"name": ev["name"],
-                             "arguments": ev["arguments"]},
-            }]}
+            return {
+                "tool_calls": [
+                    {
+                        "index": ev["index"],
+                        "id": ev["id"],
+                        "type": "function",
+                        "function": {"name": ev["name"], "arguments": ev["arguments"]},
+                    }
+                ]
+            }
 
         def _fire_cancel():
             try:
-                requests.post(f"{node.http_base}/pd/cancel",
-                              json={"rid": rid}, timeout=5)
+                requests.post(f"{node.http_base}/pd/cancel", json={"rid": rid}, timeout=5)
             except Exception:
                 logger.warning("cancel POST failed for %s", rid)
 
@@ -303,11 +306,16 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             try:
                 yield _chunk({"role": "assistant"})
                 async with client.stream(
-                        "POST", f"{node.http_base}/pd/decode",
-                        json={"rid": rid, "first_token_id": first_token_id,
-                              "max_tokens": _max_tokens_of(body),
-                              "sampling": _sampling_of(body),
-                              "stream": True}) as resp:
+                    "POST",
+                    f"{node.http_base}/pd/decode",
+                    json={
+                        "rid": rid,
+                        "first_token_id": first_token_id,
+                        "max_tokens": _max_tokens_of(body),
+                        "sampling": _sampling_of(body),
+                        "stream": True,
+                    },
+                ) as resp:
                     resp.raise_for_status()
                     async for line in resp.aiter_lines():
                         # Deterministic client-liveness check: writes to a
@@ -315,8 +323,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         # poll the ASGI disconnect state every line.
                         if await request.is_disconnected():
                             client_gone = True
-                            logger.info("client disconnected, cancelling %s",
-                                        rid)
+                            logger.info("client disconnected, cancelling %s", rid)
                             break
                         if not line:
                             continue
@@ -338,8 +345,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             if finish_reason == "cancelled":
                                 finish_reason = "stop"
                         elif "error" in msg:
-                            yield _chunk(
-                                {"content": f"\n[decode error: {msg['error']}]"})
+                            yield _chunk({"content": f"\n[decode error: {msg['error']}]"})
                             finish_reason = "stop"
                 if client_gone:
                     logger.info("client gone mid-stream for %s", rid)
@@ -351,10 +357,14 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         yield _chunk(_event_delta(ev))
                 if saw_tool:
                     finish_reason = "tool_calls"
-                yield _chunk({}, finish=finish_reason, usage={
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": n_tokens,
-                })
+                yield _chunk(
+                    {},
+                    finish=finish_reason,
+                    usage={
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": n_tokens,
+                    },
+                )
                 yield "data: [DONE]\n\n"
                 completed_ok = True
             except Exception:
@@ -390,27 +400,31 @@ def build_app(ctx: RouterCtx) -> FastAPI:
         body = await request.json()
         if body.get("stream"):
             return JSONResponse(
-                {"error": "streaming is supported on /v1/chat/completions"},
-                status_code=400)
+                {"error": "streaming is supported on /v1/chat/completions"}, status_code=400
+            )
         return await run_in_threadpool(_handle, "/v1/completions", body)
 
-    return app
+    return app  # noqa: R504 (assembled across the function)
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(name)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm-url", required=True)
-    ap.add_argument("--decode", nargs="+", required=True,
-                    help="decode nodes as host:ctrl_port:http_port")
-    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument(
+        "--decode", nargs="+", required=True, help="decode nodes as host:ctrl_port:http_port"
+    )
+    ap.add_argument("--host", default="0.0.0.0")  # nosec B104 (bind-all by design)
     ap.add_argument("--port", type=int, default=23333)
-    ap.add_argument("--model-path", default="",
-                    help="tokenizer path (required unless --parser none)")
-    ap.add_argument("--parser", choices=["glm47", "none"],
-                    default="glm47",
-                    help="output parser (reasoning + tool calls)")
+    ap.add_argument(
+        "--model-path", default="", help="tokenizer path (required unless --parser none)"
+    )
+    ap.add_argument(
+        "--parser",
+        choices=["glm47", "none"],
+        default="glm47",
+        help="output parser (reasoning + tool calls)",
+    )
     args = ap.parse_args()
 
     nodes = []
@@ -421,13 +435,20 @@ def main() -> None:
     tokenizer = None
     if args.model_path:
         from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path, trust_remote_code=True)  # nosec B615
+            args.model_path, trust_remote_code=True
+        )  # nosec B615
 
     ctx = RouterCtx(args.vllm_url, Pool(nodes), tokenizer, args.parser)
     app = build_app(ctx)
-    logger.info("router on :%d -> vllm=%s, %d decode node(s), parser=%s",
-                args.port, args.vllm_url, len(nodes), args.parser)
+    logger.info(
+        "router on :%d -> vllm=%s, %d decode node(s), parser=%s",
+        args.port,
+        args.vllm_url,
+        len(nodes),
+        args.parser,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

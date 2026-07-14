@@ -1,5 +1,6 @@
 """Decode-side receive server (W4): Mooncake buffer + TCP control plane."""
 
+import contextlib
 import logging
 import queue
 import socket
@@ -44,8 +45,12 @@ class ReceiveServer:
         self.request_timeout = request_timeout
 
         total = profile.buffer_bytes(max_seq_len)
-        logger.info("allocating receive buffer: %.2f GB on %s (profile=%s)",
-                    total / 1024**3, device, profile.name)
+        logger.info(
+            "allocating receive buffer: %.2f GB on %s (profile=%s)",
+            total / 1024**3,
+            device,
+            profile.name,
+        )
         self.buffer = torch.zeros(total, dtype=torch.uint8, device=device)
         self.base_ptr = self.buffer.data_ptr()
         self._hello_layout = profile.hello_layout(self.base_ptr, max_seq_len)
@@ -60,8 +65,9 @@ class ReceiveServer:
         self._transport.init(hostname)
         self._transport.register(self.base_ptr, total, dev_id)
         self._transport_meta = self._transport.local_meta()
-        logger.info("transport=%s ready, buffer registered (%.2f GB)",
-                    self._transport.name, total / 1024**3)
+        logger.info(
+            "transport=%s ready, buffer registered (%.2f GB)", self._transport.name, total / 1024**3
+        )
 
         self._lock = threading.Lock()
         self._current: ReceivedRequest | None = None
@@ -71,15 +77,14 @@ class ReceiveServer:
         # (e.g. an IPv6-only decode node reached over fe80::.../bond0)
         self._srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
+        with contextlib.suppress(OSError):
             self._srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        except OSError:
-            pass
         self._srv.bind(("::", ctrl_port))
         self._srv.listen(32)
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._accept_loop,
-                                        name="pd-recv-accept", daemon=True)
+        self._thread = threading.Thread(
+            target=self._accept_loop, name="pd-recv-accept", daemon=True
+        )
         self._thread.start()
         logger.info("control plane listening on :%d", ctrl_port)
 
@@ -92,10 +97,8 @@ class ReceiveServer:
 
     def close(self) -> None:
         self._stop.set()
-        try:
+        with contextlib.suppress(OSError):
             self._srv.close()
-        except OSError:
-            pass
 
     # ── accept / per-connection handling ─────────────────────────────────
 
@@ -105,8 +108,7 @@ class ReceiveServer:
                 conn, addr = self._srv.accept()
             except OSError:
                 break
-            t = threading.Thread(target=self._handle, args=(conn, addr),
-                                 daemon=True)
+            t = threading.Thread(target=self._handle, args=(conn, addr), daemon=True)
             t.start()
 
     def _handle(self, conn: socket.socket, addr) -> None:
@@ -116,12 +118,18 @@ class ReceiveServer:
             # `busy` in hello is advisory (a same-rid rank must still proceed);
             # the authoritative accept/reject happens once the rid is known.
             with self._lock:
-                advisory_busy = (self._current is not None
-                                 and self._current.t_complete == 0.0)
-            wire.send_msg(conn, wire.hello_msg(
-                self._transport.name, self._transport_meta, self.max_seq_len,
-                self.profile.layout_version, self._hello_layout,
-                busy=advisory_busy))
+                advisory_busy = self._current is not None and self._current.t_complete == 0.0
+            wire.send_msg(
+                conn,
+                wire.hello_msg(
+                    self._transport.name,
+                    self._transport_meta,
+                    self.max_seq_len,
+                    self.profile.layout_version,
+                    self._hello_layout,
+                    busy=advisory_busy,
+                ),
+            )
 
             req = wire.recv_msg(conn)
             rid, rank = req["rid"], int(req["rank"])
@@ -132,8 +140,11 @@ class ReceiveServer:
             with self._lock:
                 cur = self._current
                 if cur is None or cur.rid != rid:
-                    if cur is not None and cur.t_complete == 0.0 and \
-                            time.time() - cur.t_first_conn < self.request_timeout:
+                    if (
+                        cur is not None
+                        and cur.t_complete == 0.0
+                        and time.time() - cur.t_first_conn < self.request_timeout
+                    ):
                         # busy with a different in-flight rid
                         wire.send_msg(conn, {"error": "busy", "busy_rid": cur.rid})
                         logger.warning("rejecting %s (busy with %s)", rid, cur.rid)
@@ -158,14 +169,21 @@ class ReceiveServer:
                 if cur is None or cur.rid != rid:
                     return
                 cur.done_ranks.add(rank)
-                logger.info("request %s: rank %d done (%d/%d)",
-                            rid, rank, len(cur.done_ranks),
-                            len(self.profile.sender_ranks))
+                logger.info(
+                    "request %s: rank %d done (%d/%d)",
+                    rid,
+                    rank,
+                    len(cur.done_ranks),
+                    len(self.profile.sender_ranks),
+                )
                 if cur.done_ranks >= set(self.profile.sender_ranks):
                     cur.t_complete = time.time()
                     self.completed.put(cur)
-                    logger.info("request %s: all ranks done in %.1f ms",
-                                rid, 1000 * (cur.t_complete - cur.t_first_conn))
+                    logger.info(
+                        "request %s: all ranks done in %.1f ms",
+                        rid,
+                        1000 * (cur.t_complete - cur.t_first_conn),
+                    )
         except Exception:
             logger.exception("connection from %s failed", addr)
         finally:

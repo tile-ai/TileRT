@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
-
 import torch
 import torch.nn.functional as F
 
@@ -336,6 +335,7 @@ class ExpertSelectUpGateSiLUWeightsConverter(TilertWeightsConverter):
         moe_inter_pd = self.model_args.moe_inter_dim // self.num_devices
 
         with torch.inference_mode():
+
             def _ensure_unpacked(t: torch.Tensor) -> torch.Tensor:
                 if t.shape[-1] == dim:
                     return t.to(torch.uint8).contiguous()
