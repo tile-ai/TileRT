@@ -150,7 +150,7 @@ def build_app(ctx: RouterCtx) -> FastAPI:
         return r.json()
 
     def _sampling_of(body):
-        return {k: body[k] for k in ("temperature", "top_p", "top_k") if k in body}
+        return {k: body[k] for k in ("temperature", "top_p", "top_k", "ignore_eos") if k in body}
 
     def _max_tokens_of(body):
         return int(body.get("max_tokens") or body.get("max_completion_tokens") or 256)
@@ -267,6 +267,17 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                 payload["usage"] = usage
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+        def _usage_chunk(usage: dict) -> str:
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
         def _event_delta(ev: dict) -> dict:
             if ev["kind"] == "reasoning":
                 return {"reasoning_content": ev["text"]}
@@ -357,13 +368,13 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         yield _chunk(_event_delta(ev))
                 if saw_tool:
                     finish_reason = "tool_calls"
-                yield _chunk(
-                    {},
-                    finish=finish_reason,
-                    usage={
+                yield _chunk({}, finish=finish_reason)
+                yield _usage_chunk(
+                    {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": n_tokens,
-                    },
+                        "total_tokens": (prompt_tokens or 0) + n_tokens,
+                    }
                 )
                 yield "data: [DONE]\n\n"
                 completed_ok = True
