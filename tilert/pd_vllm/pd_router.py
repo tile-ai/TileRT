@@ -97,6 +97,37 @@ def _thinking_enabled(body: dict) -> bool:
     return bool(ctk.get("enable_thinking", True))
 
 
+# Client fields that must not survive into the prefill request, which is
+# forwarded verbatim apart from the fields we set: stream_options contradicts
+# the stream=False we force (vLLM rejects the pair with a 400 during body
+# parsing), and max_completion_tokens takes precedence over max_tokens, so it
+# would override our max_tokens=1. Streaming clients send both.
+_PREFILL_DROP_FIELDS = ("stream_options", "max_completion_tokens")
+
+
+def build_prefill_body(path: str, body: dict, node: DecodeNode) -> dict:
+    """The vLLM request that prefills only and hands the KV state to ``node``.
+
+    Lives outside ``build_app`` so the rewrite can be exercised without a
+    router process, a vLLM instance or a decode node.
+    """
+    prefill_body = dict(body)
+    prefill_body["max_tokens"] = 1
+    prefill_body["stream"] = False
+    for field in _PREFILL_DROP_FIELDS:
+        prefill_body.pop(field, None)
+    if path.endswith("chat/completions"):
+        prefill_body["logprobs"] = True
+        prefill_body["top_logprobs"] = 1
+    else:
+        prefill_body["logprobs"] = 1
+    prefill_body["kv_transfer_params"] = {
+        "tilert_host": node.host,
+        "tilert_ctrl_port": node.ctrl_port,
+    }
+    return prefill_body
+
+
 class RouterCtx:
     """Immutable per-process context (tokenizer, parser factory, config)."""
 
@@ -133,24 +164,13 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     # ── shared prefill step ──────────────────────────────────────────────
     def _prefill(path, body, node):
-        prefill_body = dict(body)
-        prefill_body["max_tokens"] = 1
-        prefill_body["stream"] = False
-        if path.endswith("chat/completions"):
-            prefill_body["logprobs"] = True
-            prefill_body["top_logprobs"] = 1
-        else:
-            prefill_body["logprobs"] = 1
-        prefill_body["kv_transfer_params"] = {
-            "tilert_host": node.host,
-            "tilert_ctrl_port": node.ctrl_port,
-        }
+        prefill_body = build_prefill_body(path, body, node)
         r = requests.post(f"{ctx.vllm_url}{path}", json=prefill_body, timeout=600)
         r.raise_for_status()
         return r.json()
 
     def _sampling_of(body):
-        return {k: body[k] for k in ("temperature", "top_p", "top_k") if k in body}
+        return {k: body[k] for k in ("temperature", "top_p", "top_k", "ignore_eos") if k in body}
 
     def _max_tokens_of(body):
         return int(body.get("max_tokens") or body.get("max_completion_tokens") or 256)
@@ -267,6 +287,17 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                 payload["usage"] = usage
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+        def _usage_chunk(usage: dict) -> str:
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
         def _event_delta(ev: dict) -> dict:
             if ev["kind"] == "reasoning":
                 return {"reasoning_content": ev["text"]}
@@ -357,13 +388,13 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         yield _chunk(_event_delta(ev))
                 if saw_tool:
                     finish_reason = "tool_calls"
-                yield _chunk(
-                    {},
-                    finish=finish_reason,
-                    usage={
+                yield _chunk({}, finish=finish_reason)
+                yield _usage_chunk(
+                    {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": n_tokens,
-                    },
+                        "total_tokens": (prompt_tokens or 0) + n_tokens,
+                    }
                 )
                 yield "data: [DONE]\n\n"
                 completed_ok = True
