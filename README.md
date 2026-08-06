@@ -412,6 +412,58 @@ python -m tilert.pd_vllm.pd_router --vllm-url http://<PREFILL_IP>:8000 \
 
 **Note.** Running NIXL end to end (both the native and TileRT connectors in NIXL mode) lets the shared prefill use a single transfer library. Only the prefill's `--kv-transfer-config` differs from Topology A; the TileRT decode node is unchanged, and the native decode instance plus its proxy follow vLLM's usual `NixlConnector` disaggregation setup.
 
+### Benchmarking a PD deployment(glm5.1,vllm+tilert)
+
+Streaming is supported since v0.1.5.post2, so `vllm bench serve` can drive the
+router directly through the standard OpenAI chat backend:
+
+```bash
+vllm bench serve \
+    --backend openai-chat \
+    --base-url http://<ROUTER_IP>:23333 \
+    --model /path/to/GLM-5.1-FP8 \
+    --served-model-name glm5 \
+    --dataset-name random \
+    --random-input-len 64000 --random-output-len 3000 \
+    --random-range-ratio 0.0 \
+    --num-prompts 10 --request-rate inf \
+    --max-concurrency 1 --ignore-eos
+```
+
+#### Reference numbers: single-node co-located deployment
+
+One 8×B300 node running all three processes together — vLLM prefill, TileRT
+decode and the router share the same 8 GPUs (the router itself is CPU-only).
+GLM-5.1-FP8 with MTP, 64K input / 3K output*10, one request at a time, driven by
+the `vllm bench serve` command above:
+
+| Latency | Mean | Median | P99 |
+| ------------------------- | -------: | -------: | -------: |
+| TTFT (ms) | 5153.37 | 5466.57 | 5488.29 |
+| TPOT (ms) | 3.44 | 3.33 | 3.99 |
+| ITL, per SSE chunk (ms) | 8.44 | 10.11 | 10.79 |
+| End-to-end latency (ms) | 15471.96 | 15430.76 | 17458.84 |
+
+| Throughput | Value |
+| --------------------------- | -------- |
+| Output tokens | 193.90 tok/s |
+| Input + output tokens | 4330.34 tok/s |
+| Requests | 0.06 req/s |
+| Duration, 10 requests | 154.72 s |
+
+Reading the numbers: a mean TPOT of 3.44 ms is **~291 total tokens/s & 441 output tokens/s for the
+single in-flight request**, and the 5.15 s TTFT covers the full 64K-token vLLM
+prefill (~12.4K tokens/s) plus the KV handoff. Aggregate output throughput
+(193.9 tok/s) is lower than the per-request decode rate because prefill and
+decode are serialized at concurrency 1. The mean ITL of 8.44 ms is per SSE
+chunk, not per token — `8.44 / 3.44 ≈ 2.5` accepted tokens per MTP step.
+
+Because prefill and decode are co-located, they contend for the same SMs and
+the KV handoff never leaves the host; a two-node split trades that contention
+for a real RDMA hop.
+
+
+
 ## Status & Future Work
 
 TileRT is currently offered as a preview release, and we’re just getting started.
