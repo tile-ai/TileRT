@@ -334,8 +334,14 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             detok = IncrementalDetok(ctx.tokenizer)
             sess = parser.stream() if parser else None
             client = httpx.AsyncClient(timeout=httpx.Timeout(600, read=600))
+            role_sent = False
+
+            def _role_once():
+                nonlocal role_sent
+                role_sent = True
+                return _chunk({"role": "assistant"})
+
             try:
-                yield _chunk({"role": "assistant"})
                 async with client.stream(
                     "POST",
                     f"{node.http_base}/pd/decode",
@@ -364,6 +370,8 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             text = detok.push(msg["t"])
                             if not text:
                                 continue
+                            if not role_sent:
+                                yield _role_once()
                             if sess is None:
                                 yield _chunk({"content": text})
                                 continue
@@ -388,6 +396,8 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         yield _chunk(_event_delta(ev))
                 if saw_tool:
                     finish_reason = "tool_calls"
+                if not role_sent:
+                    yield _role_once()
                 yield _chunk({}, finish=finish_reason)
                 yield _usage_chunk(
                     {
