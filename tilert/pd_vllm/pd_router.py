@@ -384,6 +384,8 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             if finish_reason == "cancelled":
                                 finish_reason = "stop"
                         elif "error" in msg:
+                            if not role_sent:
+                                yield _role_once()
                             yield _chunk({"content": f"\n[decode error: {msg['error']}]"})
                             finish_reason = "stop"
                 if client_gone:

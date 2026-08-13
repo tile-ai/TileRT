@@ -441,19 +441,25 @@ class MlaNsaEngineAdapter:
             if fwd == 0:
                 fwd += 1
                 continue
-            accepted.extend(per_step)
             fwd += 1
-            for tok in emitted:
-                if len(tokens) >= budget:
+            offset = 0
+            for na in per_step:
+                step_emit = emitted[offset : offset + na]
+                offset += na
+                for tok in step_emit:
+                    if len(tokens) >= budget:
+                        break
+                    tok = int(tok)
+                    if tok in stop_ids:
+                        finished = True
+                        finish = "stop"
+                        break
+                    tokens.append(tok)
+                    if on_token:
+                        on_token(tok)
+                accepted.append(na)
+                if finished or len(tokens) >= budget:
                     break
-                tok = int(tok)
-                if tok in stop_ids:
-                    finished = True
-                    finish = "stop"
-                    break
-                tokens.append(tok)
-                if on_token:
-                    on_token(tok)
         dl.reset_sequence()
         self.last_stats = {
             "finish_reason": finish,
