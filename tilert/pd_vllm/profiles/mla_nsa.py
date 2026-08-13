@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
@@ -364,6 +365,7 @@ class MlaNsaEngineAdapter:
         self.max_seq_len = getattr(generator.decode_layer, "max_seq_len", 200000)
         self.last_stats: dict = {}
         self.stop_ids = self._resolve_stop_ids(generator)
+        self._ignore_eos = False
 
     @staticmethod
     def _resolve_stop_ids(generator) -> set:
@@ -392,6 +394,7 @@ class MlaNsaEngineAdapter:
                 top_k=int(sampling.get("top_k", 256)),
                 use_topp=True,
             )
+        self._ignore_eos = bool(sampling.get("ignore_eos"))
         budget = min(int(max_tokens), self.max_seq_len - self._seq_len - 1)
         if budget <= 0:
             self.last_stats = {"finish_reason": "length"}
@@ -403,7 +406,7 @@ class MlaNsaEngineAdapter:
     def _decode_mtp(self, first_token_id, budget, on_token, cancel_event):
         dl = self.gen.decode_layer
         T = self.mtp_seq_len
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
@@ -412,6 +415,7 @@ class MlaNsaEngineAdapter:
             self.last_stats = {"finish_reason": "stop"}
             return []
         dl.set_prefill_valid_tokens(0)
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
         draft = torch.full((1, T), int(self._last_prompt_token), dtype=torch.int32, device="cuda:0")
         accepted, finish, fwd, finished = [], "length", 0, False
         while not finished and len(tokens) < budget:
@@ -422,25 +426,40 @@ class MlaNsaEngineAdapter:
                 draft = torch.full((1, T), int(first_token_id), dtype=torch.int32, device="cuda:0")
             elif fwd > 1:
                 draft = dl.get_next_draft_tokens(0).reshape(1, T)
-            dl.forward(draft)
-            n_acc = dl.get_num_accepted(0)
-            pred = dl.get_predicted_tokens(0).flatten()
+            if fwd == 0:
+                steps = 1
+            else:
+                rem = budget - len(tokens)
+                steps = max(1, min(ar_steps, -(-rem // T)))
+            dl.show_hands(draft, steps)
+            acc = dl.ar_accepted_tokens(0).cpu()
+            num = dl.ar_num_accepted(0).cpu()
+            n_tokens = int(acc[0].item())
+            n_steps = int(num[0].item())
+            emitted = acc[1 : 1 + n_tokens].tolist()
+            per_step = num[1 : 1 + n_steps].tolist()
             if fwd == 0:
                 fwd += 1
                 continue
-            accepted.append(n_acc)
             fwd += 1
-            for i in range(n_acc):
-                if len(tokens) >= budget:
+            offset = 0
+            for na in per_step:
+                step_emit = emitted[offset : offset + na]
+                offset += na
+                for tok in step_emit:
+                    if len(tokens) >= budget:
+                        break
+                    tok = int(tok)
+                    if tok in stop_ids:
+                        finished = True
+                        finish = "stop"
+                        break
+                    tokens.append(tok)
+                    if on_token:
+                        on_token(tok)
+                accepted.append(na)
+                if finished or len(tokens) >= budget:
                     break
-                tok = int(pred[i].item())
-                if tok in stop_ids:
-                    finished = True
-                    finish = "stop"
-                    break
-                tokens.append(tok)
-                if on_token:
-                    on_token(tok)
         dl.reset_sequence()
         self.last_stats = {
             "finish_reason": finish,
@@ -450,10 +469,8 @@ class MlaNsaEngineAdapter:
         return tokens
 
     def _decode_standard(self, first_token_id, budget, on_token, cancel_event):
-        from tilert.models.deepseek_v3_2.temp_var_indices import Idx
-
         dl = self.gen.decode_layer
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
@@ -461,23 +478,33 @@ class MlaNsaEngineAdapter:
         if int(first_token_id) in stop_ids:
             self.last_stats = {"finish_reason": "stop"}
             return []
-        finish = "length"
-        cur = torch.tensor(int(first_token_id), dtype=torch.long, device="cuda:0")
-        while len(tokens) < budget:
+        dl.set_prefill_valid_tokens(0, with_mtp=False)
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
+        finish, finished = "length", False
+        last_tok = int(first_token_id)
+        prev = torch.tensor([last_tok], dtype=torch.int32, device="cuda:0")
+        while not finished and len(tokens) < budget:
             if cancel_event is not None and cancel_event.is_set():
                 finish = "cancelled"
                 break
-            res = dl.forward(cur)
-            intermediates, *_ = res[0]
-            nxt = intermediates[Idx.TOKEN_OUT][0][0]
-            tok = int(nxt.item())
-            if tok in stop_ids:
-                finish = "stop"
-                break
-            tokens.append(tok)
-            if on_token:
-                on_token(tok)
-            cur = nxt
+            steps = max(1, min(ar_steps, budget - len(tokens)))
+            dl.show_hands_no_mtp(prev, steps)
+            acc = dl.ar_accepted_tokens_no_mtp(0).cpu()
+            n_tokens = int(acc[0].item())
+            emitted = acc[1 : 1 + n_tokens].tolist()
+            for tok in emitted:
+                if len(tokens) >= budget:
+                    break
+                tok = int(tok)
+                if tok in stop_ids:
+                    finished = True
+                    finish = "stop"
+                    break
+                tokens.append(tok)
+                last_tok = tok
+                if on_token:
+                    on_token(tok)
+            prev = torch.tensor([last_tok], dtype=torch.int32, device="cuda:0")
         dl.reset_sequence()
         self.last_stats = {"finish_reason": finish}
         return tokens

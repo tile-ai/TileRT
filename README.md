@@ -20,7 +20,7 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5) Released**. Introduce [**PD (prefill–decode) disaggregation**](https://www.tilert.ai/blog/tilert-vllm-disaggregation.html) — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5/5.1 and DeepSeek-V3.2.
+- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5.post2) Released**. Introduce [**PD (prefill–decode) disaggregation**](https://www.tilert.ai/blog/tilert-vllm-disaggregation.html) — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5/5.1 and DeepSeek-V3.2.
 
 - 💥 **2026-06-08 · [Breaking 1000 TPS on a 1T Model](https://www.tilert.ai/blog/breaking-1000-tps.html)**. In collaboration with [Xiaomi MiMo](https://mimo.xiaomi.com/blog/mimo-tilert-1000tps), TileRT pushes [**MiMo-V2.5-Pro-UltraSpeed**](https://platform.xiaomimimo.com/docs/en-US/model-intro/mimo-v2.5-pro-ultraspeed) past **1000 tokens/s** on a **1-trillion-parameter** model through extreme model–system co-design — a first without custom silicon, all on a single 8-GPU node.
 
@@ -70,7 +70,7 @@ ______________________________________________________________________
 
 ### Build environment of the v0.1.5 wheel
 
-The official `tilert==0.1.5.post1` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds.
+The official `tilert==0.1.5.post2` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds (`transformers` / `tokenizers` are lower bounds since v0.1.5.post2).
 
 | Component        | Pinned version                                      |
 | ---------------- | --------------------------------------------------- |
@@ -79,8 +79,8 @@ The official `tilert==0.1.5.post1` wheel on PyPI was compiled against the follow
 | Operating System | Linux **x86_64**, glibc **≥ 2.28** (manylinux_2_28) |
 | Python           | **3.12**                                            |
 | PyTorch          | **`torch==2.11.0+cu130`**                           |
-| `transformers`   | **`4.46.3`**                                        |
-| `tokenizers`     | **`0.20.3`**                                        |
+| `transformers`   | **`>= 4.46.3`**                                     |
+| `tokenizers`     | **`>= 0.20.3`**                                     |
 
 ### Recommended: pre-built Docker image
 
@@ -106,18 +106,18 @@ docker run --rm -it --gpus all --ipc=host \
     ghcr.io/tile-ai/tilert:cu132-latest
 
 # Inside the container — install from PyPI:
-pip install tilert==0.1.5.post1
+pip install tilert==0.1.5.post2
 
 # Or pin the exact wheel from the GitHub Release page directly
 # (same artifact, useful when PyPI is unreachable):
-pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5/tilert-0.1.5.post1-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5.post2/tilert-0.1.5.post2-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
 
 Verify the install:
 
 ```bash
 python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__, '/ cuda', torch.version.cuda)"
-# Expected: tilert 0.1.5.post1 / torch 2.11.0+cu130 / cuda 13.0
+# Expected: tilert 0.1.5.post2 / torch 2.11.0+cu130 / cuda 13.0
 ```
 
 Proceed to [Getting Started](#getting-started) to download and convert model weights.
