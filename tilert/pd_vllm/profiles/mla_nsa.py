@@ -364,6 +364,7 @@ class MlaNsaEngineAdapter:
         self.max_seq_len = getattr(generator.decode_layer, "max_seq_len", 200000)
         self.last_stats: dict = {}
         self.stop_ids = self._resolve_stop_ids(generator)
+        self._ignore_eos = False
 
     @staticmethod
     def _resolve_stop_ids(generator) -> set:
@@ -392,6 +393,7 @@ class MlaNsaEngineAdapter:
                 top_k=int(sampling.get("top_k", 256)),
                 use_topp=True,
             )
+        self._ignore_eos = bool(sampling.get("ignore_eos"))
         budget = min(int(max_tokens), self.max_seq_len - self._seq_len - 1)
         if budget <= 0:
             self.last_stats = {"finish_reason": "length"}
@@ -403,7 +405,7 @@ class MlaNsaEngineAdapter:
     def _decode_mtp(self, first_token_id, budget, on_token, cancel_event):
         dl = self.gen.decode_layer
         T = self.mtp_seq_len
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
@@ -453,7 +455,7 @@ class MlaNsaEngineAdapter:
         from tilert.models.deepseek_v3_2.temp_var_indices import Idx
 
         dl = self.gen.decode_layer
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
