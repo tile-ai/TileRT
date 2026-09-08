@@ -121,6 +121,17 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 warn_return_any = false
 
+# The pd_vllm tests drive the real modules through duck-typed fakes
+# (SimpleNamespace servers, recording engines), so def-level annotations and
+# attribute checks on those doubles are noise; syntax and import errors still
+# surface.
+[[tool.mypy.overrides]]
+module = "tests.pd_vllm.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+warn_return_any = false
+
 [tool.bandit]
 exclude_dirs = ["tests", "3rd-party"]
 skips = ["B101", "B311", "B404", "B603", "B607"]
@@ -164,6 +175,7 @@ ignore = [
 [tool.flake8.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/*" = ["D100", "D101", "D102", "D103"]
+"tests/pd_vllm/*" = ["D205", "D210", "D403", "U100", "U101", "SIM117", "R504", "VNE002"]
 "setup.py" = ["D100", "D101", "D102", "D103", "B009"]
 
 [tool.flake8.bugbear]

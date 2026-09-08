@@ -12,6 +12,11 @@ small surface the router needs:
 Runs in the ROUTER environment only — that env must have vllm installed
 (CPU-only import is fine; verified with CUDA_VISIBLE_DEVICES=""). The decode
 node never imports vllm.
+
+Verified against real AIME transcripts (prefilled-<think> convention, incl. a
+135K-char truncated-thinking sample) and template-format tool calls with
+random-delta streaming fuzz. Key engine semantics (cost a bug to learn):
+``TOOL_NAME`` is an incremental chunk event — fragments must be concatenated.
 """
 
 import logging
@@ -26,6 +31,11 @@ class ToolCall:
     call_id: str
     name: str
     arguments: str  # JSON string (OpenAI convention)
+
+    @property
+    def id(self) -> str:  # noqa: A003
+        """Alias of ``call_id`` under the OpenAI field name."""
+        return self.call_id
 
     def to_openai(self, index: int) -> dict:
         return {
@@ -50,7 +60,7 @@ def _new_call_id() -> str:
 # family -> (config-builder import path, arg-converter import path). The
 # glm47_moe parser engine uses the vllm.parser API shape (a `*_config(thinking)`
 # builder + a `_*_arg_converter(raw, partial)`); the adapter picks the engine
-# by family name.
+# by family name, so another family with the same shape is one table entry.
 _FAMILIES = {
     "glm47": ("vllm.parser.glm47_moe", "glm47_moe_config", "_glm47_arg_converter"),
 }
@@ -203,25 +213,68 @@ class IncrementalDetok:
     r"""Incremental token→text for byte-level BPE tokenizers.
 
     Decodes a bounded trailing window; holds output while the window ends in
-    a partial multi-byte sequence (\\ufffd). Window folding is safe for
+    a partial multi-byte sequence (\ufffd). Window folding is safe for
     byte-level BPE: separate windows decode to concatenable byte streams.
-    Specials are KEPT (skip_special_tokens=False) — the parser consumes
-    </think> etc.; the stop token never reaches the stream (engine adapter
-    suppresses it).
+
+    ``finish`` releases what is held. A generation can end mid-character -- EOS
+    or ``max_tokens`` after the first byte of two -- and the ids are reported
+    either way, so without the release the reply would omit a character the
+    tokenizer makes of the ids it reports.
+
+    Specials are kept by default — a parser consumes </think> and friends, and
+    the stop token never reaches the stream because the engine adapter
+    suppresses it. A caller with no parser passes True instead: nothing
+    downstream would consume a special, so one would surface as content. The
+    policy is a constructor argument rather than a per-call one so a request
+    cannot be matched against one spelling of its own output and shown another.
     """
 
     _FOLD = 256
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, skip_special_tokens: bool = False):
         self._tok = tokenizer
+        self._skip = skip_special_tokens
         self._ids: list[int] = []
         self._emitted = 0
+        self._holding = False
+
+    @property
+    def holding(self) -> bool:
+        """Whether the last push produced nothing because it was incomplete.
+
+        Distinguishes a byte fragment — whose text arrives with a later token —
+        from a token that genuinely decodes to nothing, such as a special the
+        caller strips. Both return an empty delta, and a caller pairing
+        per-token metadata against the text has to tell them apart.
+        """
+        return self._holding
+
+    def finish(self) -> str:
+        """Whatever ``push`` held back because the window ended mid-character.
+
+        Generation can stop between the byte-level tokens of one character -- EOS
+        or ``max_tokens`` arriving after its first byte -- and the tokenizer's own
+        decode of the complete id list then ends in the replacement character.
+        Dropping it loses a character the reply had, while ``token_ids``, usage
+        and the logprob entry all still count the token.
+        """
+        # Idempotent through `_emitted`, which the first call advances to the
+        # end; the `_holding` early-out is a shortcut, not the guarantee.
+        if not self._holding:
+            return ""
+        text = self._tok.decode(self._ids, skip_special_tokens=self._skip)
+        delta = text[self._emitted :]
+        self._emitted = len(text)
+        self._holding = False
+        return delta  # noqa: R504 (self._emitted mutated after delta is computed)
 
     def push(self, ids: list[int]) -> str:
         self._ids.extend(ids)
-        text = self._tok.decode(self._ids, skip_special_tokens=False)
-        if text.endswith("�"):
+        text = self._tok.decode(self._ids, skip_special_tokens=self._skip)
+        if text.endswith("\ufffd"):
+            self._holding = True
             return ""
+        self._holding = False
         delta = text[self._emitted :]
         self._emitted = len(text)
         if len(self._ids) > self._FOLD:

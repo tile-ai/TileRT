@@ -19,6 +19,11 @@ The connector owns the model-agnostic plumbing (claim, chunked-prefill
 tracking, worker init, staging, background send, TCP handshake); all per-model
 extraction / layout / RDMA planning is delegated to the selected model profile
 (``tilert_model``, default ``glm5``).
+
+``tilert_sync_send`` (sending inside the forward window) is no longer
+supported: admission retries must be able to outlast the prefill response, so
+every send runs on the background sender thread. The key is ignored with a
+warning.
 """
 
 import logging
@@ -38,6 +43,25 @@ from tilert.pd_vllm.wire import derive_rid
 
 logger = logging.getLogger("pd_vllm.connector")
 
+# _send outcomes.
+_SENT = "sent"
+_REJECTED_TRANSIENT = "rejected_transient"
+_REJECTED_PERMANENT = "rejected_permanent"
+
+# Reject reasons the receive slot leaves behind on its own: it is serving another
+# rid, or draining one it abandoned. Both end within the receiver's own socket
+# timeout, so coming back shortly is worth more than dropping the shard.
+# States the slot leaves on its own, so coming back is worth it. A decode node
+# also reports a tombstoned rid as `cancelling`: the same rid is reused when
+# vLLM reschedules a preempted request, and the node drops the tombstone as soon
+# as that retry's /pd/decode arrives. Adding a reason for that case instead
+# would be PERMANENT to every connector built before it, which is how a rolling
+# upgrade would start dropping shards.
+_TRANSIENT_REJECTS = frozenset({"busy", "cancelling"})
+
+_ADMISSION_ATTEMPTS = 5
+_ADMISSION_BACKOFF_S = 0.2
+
 
 @dataclass
 class _ReqMeta:
@@ -49,6 +73,9 @@ class _ReqMeta:
     tilert_host: str
     tilert_ctrl_port: int
     sampling: dict | None = None
+    # Full prompt ids, so the decode node can seed its repetition-penalty prompt
+    # bitmap. Kept only when a penalty is actually requested (see _emit).
+    prompt_token_ids: list = field(default_factory=list)
 
 
 @dataclass
@@ -75,9 +102,15 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         self._default_host = extra.get("tilert_host")
         self._default_port = int(extra.get("tilert_ctrl_port", 5556))
-        self._sync_send = bool(extra.get("tilert_sync_send", False))
+        self._admission_attempts = int(extra.get("tilert_admission_attempts", _ADMISSION_ATTEMPTS))
         self._max_seq = int(extra.get("tilert_max_seq_len", vllm_config.model_config.max_model_len))
         self._profile = profiles.get_profile(extra.get("tilert_model", "glm5"))
+        if extra.get("tilert_sync_send"):
+            logger.warning(
+                "tilert_sync_send is no longer supported and is ignored: sends run on "
+                "the background sender thread so admission retries can outlast the "
+                "prefill response"
+            )
         self._transport_name = extra.get("tilert_transport", "mooncake")
 
         # scheduler-side
@@ -93,12 +126,11 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         self._sender_thread: threading.Thread | None = None
 
         logger.info(
-            "TileRTConnector: role=%s profile=%s target=%s:%s sync=%s",
+            "TileRTConnector: role=%s profile=%s target=%s:%s",
             role,
             self._profile.name,
             self._default_host,
             self._default_port,
-            self._sync_send,
         )
 
     # ══════════════════════ scheduler side ═════════════════════
@@ -114,7 +146,19 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         sp = getattr(new_req, "sampling_params", None)
         extra = getattr(sp, "extra_args", None) if sp is not None else None
         if extra:
-            return self._claim(extra.get("kv_transfer_params"))
+            claimed = self._claim(extra.get("kv_transfer_params"))
+            if claimed is not None:
+                # Stash whether this request needs its prompt ids shipped. It has
+                # to be read from vLLM's OWN SamplingParams: kv_transfer_params
+                # carries only {tilert_host, tilert_ctrl_port} (pd_router sets
+                # it), and the wire's `sampling` field is vestigial -- the real
+                # sampling params reach the decode node over the router's
+                # /pd/decode call, never through this connector.
+                claimed = dict(claimed)
+                claimed["_wants_prompt_ids"] = wire.wants_prompt_token_ids(
+                    {"repetition_penalty": getattr(sp, "repetition_penalty", 1.0)}
+                )
+            return claimed
         return None
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
@@ -178,6 +222,7 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             rid=derive_rid(req_id),
             num_tokens=len(token_ids),
             last_prompt_token=int(token_ids[-1]),
+            prompt_token_ids=(list(token_ids) if params.get("_wants_prompt_ids") else []),
             block_ids_per_group=groups,
             tilert_host=host,
             tilert_ctrl_port=int(params.get("tilert_ctrl_port", self._default_port)),
@@ -226,11 +271,10 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         self._transport.init(hostname)
         self._transport.register(self._staging.data_ptr(), total, dev)
 
-        if not self._sync_send:
-            self._sender_thread = threading.Thread(
-                target=self._sender_loop, name="tilert-pd-sender", daemon=True
-            )
-            self._sender_thread.start()
+        self._sender_thread = threading.Thread(
+            target=self._sender_loop, name="tilert-pd-sender", daemon=True
+        )
+        self._sender_thread.start()
         logger.info(
             "worker ready: rank=%d transport=%s staging=%.1f MB profile=%s",
             self._tp_rank,
@@ -264,11 +308,13 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             except Exception:
                 logger.exception("extraction failed for %s", m.rid)
                 continue
-            job = {"meta": m, "sections": sections, "seq": sections["seq"]}
-            if self._sync_send:
-                self._send(job)
-            else:
-                self._send_q.put(job)
+            # Always handed to the sender thread. Sending inside the forward
+            # window used to be selectable; it cannot work with admission,
+            # because the retries would then all run before the prefill
+            # response returns -- and the router cannot call /pd/decode, the
+            # only thing that clears a tombstone for a rescheduled rid, until
+            # it has.
+            self._send_q.put({"meta": m, "sections": sections, "seq": sections["seq"]})
 
     def get_finished(self, finished_req_ids):
         return None, None
@@ -279,11 +325,15 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
         while True:
             job = self._send_q.get()
             try:
-                self._send(job)
+                self._send_with_retry(job)
             except Exception:
                 logger.exception("send failed for %s", job["meta"].rid)
 
-    def _send(self, job: dict) -> None:
+    def _send(self, job: dict) -> str:
+        """One admission + RDMA attempt.
+
+        Returns ``_SENT``, ``_REJECTED_TRANSIENT`` or ``_REJECTED_PERMANENT``.
+        """
         import socket as _socket
         import time as _time
 
@@ -300,6 +350,17 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             conn.connect((m.tilert_host, m.tilert_ctrl_port))
             hello = wire.recv_msg(conn)
             assert hello.get("magic") == wire.MAGIC, f"bad hello: {hello}"
+            # Control-plane version, checked separately from the buffer layout.
+            # A receiver that predates the admission step would never send an
+            # accept, so waiting for one would hang every request; a receiver
+            # that expects it must never be written to blind. Either mismatch is
+            # a deployment error, so it fails here rather than being guessed at.
+            remote_proto = hello.get("protocol_version", 1)
+            assert remote_proto == wire.PROTOCOL_VERSION, (
+                f"control-plane protocol mismatch: decode={remote_proto} "
+                f"vs prefill={wire.PROTOCOL_VERSION}; upgrade both ends "
+                f"together"
+            )
             assert hello.get("layout_version") == self._profile.layout_version, (
                 f"layout version mismatch: {hello.get('layout_version')} "
                 f"vs {self._profile.layout_version}"
@@ -311,16 +372,49 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             remote_max_seq = int(hello["max_seq_len"])
             assert seq <= remote_max_seq, f"seq {seq} exceeds decode max_seq_len {remote_max_seq}"
 
-            wire.send_msg(
-                conn,
-                {
-                    "rid": m.rid,
-                    "rank": self._tp_rank,
-                    "seq_len": seq,
-                    "last_prompt_token": m.last_prompt_token,
-                    "sampling": m.sampling,
-                },
-            )
+            msg = {
+                "rid": m.rid,
+                "rank": self._tp_rank,
+                "seq_len": seq,
+                "last_prompt_token": m.last_prompt_token,
+                "sampling": m.sampling,
+                "admission_window_s": self._admission_window(),
+            }
+            # Rank 0 only: every rank opens its own connection, and the decode
+            # side broadcasts the ids to all 8 devices itself, so sending them
+            # per rank would just multiply the payload by 8.
+            if self._tp_rank == 0 and m.prompt_token_ids:
+                msg["prompt_token_ids"] = m.prompt_token_ids
+            wire.send_msg(conn, msg)
+
+            # ADMISSION. Nothing may touch RDMA before this: the receive buffer
+            # holds one request at a time, and writing into it uninvited lands
+            # this request's KV inside whatever the decode node is currently
+            # serving. That corruption is undetectable downstream -- the victim
+            # decodes from a mix of two prompts and answers confidently -- so the
+            # reply is checked field by field rather than just for an `error`
+            # key. An unrecognised reply is a rejection.
+            ack = wire.recv_msg(conn)
+            if not ack.get("accepted"):
+                reason = ack.get("error")
+                logger.warning("decode node refused %s rank=%d: %s", m.rid, self._tp_rank, ack)
+                # busy / cancelling are states the slot leaves on its own, so
+                # the caller may come back. Anything else is about THIS request
+                # and will be refused again.
+                return _REJECTED_TRANSIENT if reason in _TRANSIENT_REJECTS else _REJECTED_PERMANENT
+            if (
+                ack.get("rid") != m.rid
+                or ack.get("rank") != self._tp_rank
+                or not isinstance(ack.get("generation"), int)
+            ):
+                logger.error(
+                    "discarding %s rank=%d: admission does not match " "the request (%s)",
+                    m.rid,
+                    self._tp_rank,
+                    ack,
+                )
+                return _REJECTED_PERMANENT
+            generation = ack["generation"]
 
             base = self._staging.data_ptr()
             srcs, dsts, lens = self._profile.rdma_plan(
@@ -328,14 +422,72 @@ class TileRTConnector(KVConnectorBase_V1, SupportsHMA):
             )
             self._transport.write(hello, srcs, dsts, lens)
 
-            wire.send_msg(conn, {"done": True, "rid": m.rid, "rank": self._tp_rank})
+            wire.send_msg(conn, wire.done_msg(m.rid, self._tp_rank, generation))
             logger.info(
-                "sent %s: rank=%d seq=%d %.1f MB in %.1f ms",
+                "sent %s: rank=%d seq=%d gen=%d %.1f MB in %.1f ms",
                 m.rid,
                 self._tp_rank,
                 seq,
+                generation,
                 sum(lens) / 1e6,
                 1000 * (_time.time() - t0),
             )
+            return _SENT
         finally:
             conn.close()
+
+    def _admission_window(self) -> float:
+        """Total backoff this sender will spend before giving up on a rid.
+
+        Sent with every request so the decode node can size a tombstone to
+        outlast it: each retry opens a NEW connection, so the socket timeout
+        bounds one attempt and says nothing about the sequence. Derived rather
+        than cached, so it cannot drift from the attempt count it describes.
+        """
+        return _ADMISSION_BACKOFF_S * (2 ** max(0, self._admission_attempts - 1) - 1)
+
+    def _send_with_retry(self, job: dict) -> None:
+        """Re-attempt admission while the slot is only transiently unavailable.
+
+        Without this a rank turned away -- a previous transfer still draining, a
+        router that lost its busy state over a restart -- drops its shard for
+        good, and nothing tells the router: the prefill response still succeeds
+        and `/pd/decode` then waits out its whole kv_transfer_timeout for shards
+        that will never arrive. Retrying absorbs the short races; a rank that is
+        still refused after the last attempt is logged with the consequence
+        named, because this connector has no path back to the router to fail the
+        request properly.
+
+        Runs on the sender thread, never inside a forward window: the sleeps
+        below must not stall a vLLM step, and admission has to be able to
+        outlast the prefill response, which is what clears a tombstone for a
+        rescheduled rid.
+        """
+        import time as _time
+
+        m = job["meta"]
+        delay = _ADMISSION_BACKOFF_S
+        for attempt in range(1, self._admission_attempts + 1):
+            outcome = self._send(job)
+            if outcome != _REJECTED_TRANSIENT:
+                return
+            if attempt == self._admission_attempts:
+                break
+            logger.info(
+                "retrying admission for %s rank=%d in %.1fs " "(attempt %d/%d)",
+                m.rid,
+                self._tp_rank,
+                delay,
+                attempt,
+                self._admission_attempts,
+            )
+            _time.sleep(delay)
+            delay *= 2
+        logger.error(
+            "gave up admitting %s rank=%d after %d attempts: its shard was "
+            "NOT transferred, so the decode node will wait out its "
+            "kv_transfer_timeout for this request",
+            m.rid,
+            self._tp_rank,
+            self._admission_attempts,
+        )

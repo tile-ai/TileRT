@@ -315,11 +315,14 @@ TileRT can run as the **decode engine behind a vLLM prefill**, integrated throug
 **Prerequisites**
 
 - Convert the model weights for TileRT decode (see [Step 2](#step-2-shard-weights-with-weight_converter)).
-- On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5/5.1 / DeepSeek-V3.2 (DSA) model and the `fp8_ds_mla` KV-cache dtype. Install `tilert` in the same environment so the connector plugin is importable.
-- **The KV-cache dtype must match on both ends.** These examples use fp8: `--kv-cache-dtype fp8_ds_mla` on the vLLM prefill and `--kv-cache-dtype fp8` on the TileRT decode (a mismatch is rejected at the connector handshake).
+- On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5/5.1/5.2/5.3 / DeepSeek-V3.2 (DSA) model. Install `tilert` in the same environment so the connector plugin is importable.
+- **The KV-cache dtype must match on both ends.** These examples use fp8: `--kv-cache-dtype fp8_ds_mla` on the vLLM prefill and `--kv-cache-dtype fp8` on the TileRT decode (a mismatch is rejected at the connector handshake). On a vLLM build without `fp8_ds_mla` (the ROCm build, for example) use the bf16 path instead: `--kv-cache-dtype auto` on the prefill and `--kv-cache-dtype bf16` on the decode.
+- **Both ends must run the same `tilert` release.** The control plane is versioned (`PROTOCOL_VERSION`): a sender now waits to be *admitted* before it RDMA-writes, and a receiver refuses the handshake with a sender that would not. `tilert_sync_send` (sending inside the forward window) has been removed and is ignored with a warning; `tilert_admission_attempts` (default 5) bounds the admission retries.
 - The examples use the **NIXL** transfer engine. On multi-NIC hosts, pin NIXL to the RDMA NICs via `UCX_NET_DEVICES` (otherwise UCX may pick the wrong interface). Mooncake is also supported (`--transport mooncake` on the decode, `"tilert_transport": "mooncake"` on the prefill).
 
-Commands below use GLM-5/5.1. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`.
+Commands below use GLM-5/5.1. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`. For GLM-5.2 / GLM-5.3 use `--model glm5_2` (or `glm5_3`; same profile): on a ROCm torch build the ROCm engine adapter is selected automatically (`TILERT_PD_ENGINE_BACKEND=rocm|cuda` forces it), and the sparse-indexer layer set is checked at connector registration.
+
+**Router behaviour.** The router reads each decode node's `GET /capabilities` and refuses, before any prefill runs, a request whose sampling fields no node can execute (penalties, `min_p`, `seed`, `n`, ... are refused when non-neutral; `stop`, `logprobs`/`top_logprobs`, `response_format` and `ignore_eos` are served). Sampling defaults are resolved once and written to both legs: `--model` names the profile the decode nodes serve, `--generation-config auto|vllm` mirrors vLLM's flag, and `--default-temperature/--default-top-p/--default-top-k/--default-repetition-penalty` override the resolved values. `--queue-timeout` waits for a free decode node before answering 429; `--force-include-usage` adds the trailing usage chunk to every stream.
 
 ### Topology A: vLLM prefill → TileRT decode
 

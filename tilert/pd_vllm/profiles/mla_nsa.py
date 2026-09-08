@@ -1,14 +1,59 @@
-"""Shared MLA + NSA-KI data plane for the DeepSeek-family models."""
+"""Shared MLA + NSA-KI data plane for the DeepSeek-family models.
+
+GLM-5 and DeepSeek-V3.2 have the same PD data plane — MLA latent KV
+(kv_lora_rank=512 + qk_rope_head_dim=64), an NSA KI index (index_head_dim=128,
+FP8+scale, 8448 B/page), and one MTP draft layer — differing only in layer
+count and the engine generator class. Both are expressed as thin configs of
+``MlaNsaProfile`` + ``MlaNsaEngineAdapter`` below.
+
+Data plane (rank-0 only — MLA latent is replicated across TP):
+  KV plane : num_layers x [max_seq][kv_bpt] u8   (fp8: 528, bf16: 1024)
+  PE plane : num_layers x [max_seq][128]    u8   (64 bf16 k_pe, both dtypes)
+  KI plane : num_layers x [max_pages][8448] u8   (FP8 index + FP32 scale)
+
+The MLA cache dtype is a launch choice (vLLM ``--kv-cache-dtype``), independent
+of the (fp8) model weights — both paths are supported and selected at runtime:
+
+  fp8_ds_mla (recommended, SGLang-aligned): cache [nblk, page, 656] u8; per
+    token 512 fp8 kv_c + 16 B (4 fp32) scale + 128 B bf16 k_pe. Prefill splits
+    raw 656 -> 528-B kv_merged + 128-B pe; decode dequantizes kv_merged
+    fp8->bf16 (per-128 block scale).
+  bf16: cache [nblk, page, 576] bf16; per token 512 bf16 kv_c + 64 bf16 k_pe.
+    Prefill splits 1152 -> 1024-B kv + 128-B pe; decode copies bf16 as-is.
+
+In both, KI is FP8 and is dequantized fp8->bf16 + Hadamard-rotated on the
+decode side (vLLM's indexer omits the Hadamard TileRT expects); PE is bf16.
+The prefill side auto-detects the dtype from the cache stride; the decode side
+is told via ``--kv-cache-dtype`` (layout_version differs per dtype so a
+mismatched pairing is rejected at hello). Matches the validated
+serve/tilert_decode dequant + serve_vllm connector split.
+
+Engine inject uses ``inject_cache([(ki[seq,128], kv[seq,512], pe[seq,64])]
+x num_layers, start_pos=0)`` + ``set_cur_pos`` and the three-phase MTP loop
+(warm-up / override / normal) — valid for MLA (KV-cache replay is idempotent).
+
+GPU-validation TODO (per model, W2-style dump on vLLM 0.24): MLA/KI cache
+tensor shapes and per-token layout, exact num_layers incl. MTP exposure under
+--speculative-config, kv-cache group topology.
+"""
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 
 import torch
 
 from tilert.pd_vllm import wire
+from tilert.pd_vllm.grammar_backend import load_grammar_backend
+from tilert.pd_vllm.grammar_spec import (
+    GrammarBackendUnavailable,
+    GrammarViolationError,
+    InvalidGrammarError,
+)
+from tilert.pd_vllm.sampling import resolve_top_k, resolve_top_p
 
 logger = logging.getLogger("pd_vllm.profile.mla_nsa")
 
@@ -81,21 +126,41 @@ class _Reg:
 class MlaNsaProfile:
     """Config-driven MLA+NSA profile.
 
-    ``engine_factory(weights, max_seq, with_mtp, ar_steps) -> adapter`` builds
-    the model-specific engine.
+    ``engine_factory(weights, max_seq, with_mtp, ar_steps) -> adapter`` builds the
+    model-specific engine.
     """
 
     num_ranks = wire.NUM_RANKS
     sender_ranks = frozenset({0})  # MLA latent replicated across TP
 
+    # The MLA/NSA runtimes (GLM-5, GLM-5.2, DSV3.2) carry no penalty pre-pass,
+    # so MlaNsaEngineAdapter refuses a non-neutral penalty outright. Stated here
+    # too because the router needs the answer at startup, where no engine exists
+    # to ask. When the runtime gains the pre-pass, this and
+    # MlaNsaEngineAdapter.supports_penalties flip together.
+    declares_penalties = False
+
     def __init__(
-        self, name: str, num_layers: int, layout_version: int, engine_factory, mla_fp8: bool = True
+        self,
+        name: str,
+        num_layers: int,
+        layout_version: int,
+        engine_factory,
+        mla_fp8: bool = True,
+        ki_layer_ids: list[int] | None = None,
     ):
         self.name = name
         self.num_layers = num_layers
         self._base_version = layout_version
         self._engine_factory = engine_factory
         self.mla_fp8 = mla_fp8  # fp8_ds_mla (True) vs bf16 (False) MLA cache
+        # Optional strict validation of the sparse-indexer (KI) layer set:
+        # GLM-5.2 registers a KI cache only on the "full" layers; if provided,
+        # classify asserts the KI layer ids vLLM registered equal this set
+        # (ignoring the MTP tail layer, which is present only under speculative).
+        # None = data-driven (accept whatever full-layer KI set vLLM registers
+        # and expand it). GLM-5.1/DSV3.2 leave this None (dense: every layer KI).
+        self.ki_layer_ids = ki_layer_ids
 
     def configure(self, kv_cache_dtype: str) -> MlaNsaProfile:
         """Select the MLA cache dtype (decode side; prefill auto-detects)."""
@@ -185,7 +250,7 @@ class MlaNsaProfile:
 
     @staticmethod
     def _dequant_kv(kv_raw: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """Dequantize kv_merged [seq,528] u8 (512 fp8 + 4 fp32 scale) -> bf16 [seq,512].
+        """kv_merged [seq,528] u8 (512 fp8 + 4 fp32 scale) -> bf16 [seq,512].
 
         Per-128-block scale: kv[:, b*128:(b+1)*128] *= scale[:, b].
         """
@@ -249,12 +314,59 @@ class MlaNsaProfile:
                 mla.append((lid_of(name), name, t, gi))
         mla.sort(key=lambda x: x[0])
         ki.sort(key=lambda x: x[0])
-        if len(mla) != self.num_layers or len(ki) != self.num_layers:
+        if len(mla) != self.num_layers:
             raise RuntimeError(
-                f"{self.name} classify: {len(mla)} MLA + {len(ki)} KI layers "
-                f"(expected {self.num_layers} each); check --speculative-config"
+                f"{self.name} classify: {len(mla)} MLA layers "
+                f"(expected {self.num_layers}); check --speculative-config"
                 f" and the vLLM layer naming"
             )
+        # KI (sparse indexer) layer set. GLM-5.2 registers a KI cache only on the
+        # "full" layers ({0,1,2,6,10,...} + MTP tail); "shared" layers reuse the
+        # previous full layer's indexer at runtime and have NO KI cache in vLLM
+        # (verified: config.indexer_types == C++ moe_layer_is_full == vLLM
+        # deepseek_v2 _skip_topk == runtime classify dump). Expand the registered
+        # full-layer KI list to num_layers entries so extract/rdma/convert/inject
+        # stay layer-uniform: logical layer L points at the KI cache of the
+        # largest full-layer id <= L (its controlling full layer); shared layers
+        # thus replicate the previous full layer's KI. For a dense model
+        # (GLM-5.1/DSV3.2, every layer full) this is an identity no-op.
+        ki_ids = [x[0] for x in ki]
+        if not ki or ki[0][0] != 0:
+            raise RuntimeError(
+                f"{self.name} classify: KI layer 0 missing (ids={ki_ids}); "
+                f"cannot expand sparse indexer set"
+            )
+        if len(ki) > self.num_layers or ki_ids != sorted(set(ki_ids)):
+            raise RuntimeError(
+                f"{self.name} classify: bad KI layer set {ki_ids} "
+                f"(num_layers={self.num_layers})"
+            )
+        if self.ki_layer_ids is not None:
+            want = [layer for layer in self.ki_layer_ids if layer < self.num_layers]
+            want_no_mtp = [layer for layer in want if layer != self.num_layers - 1]
+            if ki_ids not in (want, want_no_mtp):
+                raise RuntimeError(
+                    f"{self.name} classify: KI layer ids {ki_ids} != expected "
+                    f"{want} (or {want_no_mtp} without the MTP tail)"
+                )
+        ki_expanded, cur, idx = [], None, 0
+        for L in range(self.num_layers):
+            while idx < len(ki) and ki[idx][0] <= L:
+                cur = ki[idx]
+                idx += 1
+            # logical layer L, KI tensor/name/group of its controlling full layer
+            assert cur is not None  # ki[0][0] == 0 was checked above
+            ki_expanded.append((L, cur[1], cur[2], cur[3]))
+        if len(ki) < self.num_layers:
+            logger.info(
+                "%s: sparse KI %d full layers %s expanded to %d "
+                "(shared layers reuse previous full layer's indexer)",
+                self.name,
+                len(ki),
+                ki_ids,
+                self.num_layers,
+            )
+        ki = ki_expanded
         # auto-detect MLA cache dtype from the actual cache stride (the prefill
         # cache is ground truth; the decode side is told via --kv-cache-dtype)
         t0 = mla[0][2]
@@ -364,6 +476,10 @@ class MlaNsaEngineAdapter:
         self.max_seq_len = getattr(generator.decode_layer, "max_seq_len", 200000)
         self.last_stats: dict = {}
         self.stop_ids = self._resolve_stop_ids(generator)
+        # Per-request, set by decode() before it picks a decode path. The
+        # adapter serves one request at a time (the decode server holds the
+        # node for the whole generation), so a plain attribute is enough.
+        self._ignore_eos = False
 
     @staticmethod
     def _resolve_stop_ids(generator) -> set:
@@ -380,30 +496,107 @@ class MlaNsaEngineAdapter:
         self._last_prompt_token = req.last_prompt_token
         self._seq_len = req.seq_len
 
-    def decode(self, first_token_id, max_tokens, sampling, on_token=None, cancel_event=None):
+    def prepare_grammar(self, grammar_spec, enable_thinking=True):
+        """Compile a per-request GrammarSession (engine cached on first use).
+
+        Raises before any GPU/inject work: unsupported path -> 500, missing
+        xgrammar -> 500, malformed spec -> 400. Never returns a session that
+        would decode unconstrained.
+        """
+        if grammar_spec is None:
+            return None
+        gen = self.gen
+        try:
+            GrammarEngine, GrammarSession = load_grammar_backend()
+        except ImportError as e:
+            raise GrammarBackendUnavailable(f"xgrammar/grammar backend unavailable: {e}") from e
+        if getattr(gen, "_grammar_engine", None) is None:
+            try:
+                gen._grammar_engine = GrammarEngine(
+                    gen.tokenizer,
+                    padded_vocab_size=gen.config.vocab_size,
+                    stop_token_ids=sorted(self.stop_ids),
+                )
+            except ImportError as e:
+                raise GrammarBackendUnavailable(f"xgrammar backend unavailable: {e}") from e
+        think_end_id = None
+        if enable_thinking:
+            tid = gen.tokenizer.convert_tokens_to_ids("</think>")
+            think_end_id = tid if isinstance(tid, int) and tid >= 0 else None
+        # MTP verifies mtp_seq_len positions per step (one mask row each);
+        # non-MTP AR has a single verify position.
+        num_positions = self.mtp_seq_len if self.with_mtp else 1
+        try:
+            return GrammarSession(
+                gen._grammar_engine,
+                grammar_spec,
+                num_positions=num_positions,
+                think_end_id=think_end_id,
+            )
+        except (ImportError, OSError) as e:
+            raise GrammarBackendUnavailable(f"xgrammar backend unavailable: {e}") from e
+        except Exception as e:
+            # Bad schema / regex / EBNF the compiler rejects -> client 400.
+            raise InvalidGrammarError(f"failed to compile grammar spec: {e}") from e
+
+    def supports_penalties(self) -> bool:
+        """No: the MLA/NSA runtimes carry no penalty pre-pass.
+
+        Stated rather than left undefined, because the router reads this over
+        ``/capabilities`` to refuse a penalty request BEFORE the prefill runs.
+        When this runtime gains the pre-pass, this becomes a probed claim
+        rather than a constant.
+        """
+        return False
+
+    def supports_ignore_eos(self) -> bool:
+        return True
+
+    def decode(
+        self,
+        first_token_id,
+        max_tokens,
+        sampling,
+        on_token=None,
+        cancel_event=None,
+        grammar_session=None,
+    ):
         sampling = sampling or {}
+        # Fail loud on a penalty this runtime cannot apply. The router normally
+        # refuses these upstream (capabilities), but /pd/decode is reachable
+        # directly and a request that reaches here must not be decoded
+        # UNPENALISED while the caller is told it succeeded.
+        rep = float(sampling.get("repetition_penalty", 1.0) or 1.0)
+        presence = float(sampling.get("presence_penalty", 0.0) or 0.0)
+        if rep != 1.0 or presence != 0.0:
+            raise NotImplementedError(
+                "repetition/presence penalties are not supported by this " "model's decode runtime"
+            )
         temp = float(sampling.get("temperature", 1.0))
         if temp < 1e-5:
             self.gen.update_sampling_params(temperature=1.0, top_p=1.0, top_k=1, use_topp=False)
         else:
             self.gen.update_sampling_params(
                 temperature=temp,
-                top_p=float(sampling.get("top_p", 0.95)),
-                top_k=int(sampling.get("top_k", 256)),
+                top_p=resolve_top_p(sampling),
+                top_k=resolve_top_k(sampling),
                 use_topp=True,
             )
+        self._ignore_eos = bool(sampling.get("ignore_eos"))
         budget = min(int(max_tokens), self.max_seq_len - self._seq_len - 1)
         if budget <= 0:
             self.last_stats = {"finish_reason": "length"}
             return [int(first_token_id)]
         if self.with_mtp:
-            return self._decode_mtp(first_token_id, budget, on_token, cancel_event)
-        return self._decode_standard(first_token_id, budget, on_token, cancel_event)
+            return self._decode_mtp(first_token_id, budget, on_token, cancel_event, grammar_session)
+        return self._decode_standard(
+            first_token_id, budget, on_token, cancel_event, grammar_session
+        )
 
-    def _decode_mtp(self, first_token_id, budget, on_token, cancel_event):
+    def _decode_mtp(self, first_token_id, budget, on_token, cancel_event, grammar_session=None):
         dl = self.gen.decode_layer
         T = self.mtp_seq_len
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
@@ -411,37 +604,99 @@ class MlaNsaEngineAdapter:
         if int(first_token_id) in stop_ids:
             self.last_stats = {"finish_reason": "stop"}
             return []
-        dl.set_prefill_valid_tokens(0)
-        draft = torch.full((1, T), int(self._last_prompt_token), dtype=torch.int32, device="cuda:0")
-        accepted, finish, fwd, finished = [], "length", 0, False
-        while not finished and len(tokens) < budget:
-            if cancel_event is not None and cancel_event.is_set():
-                finish = "cancelled"
-                break
-            if fwd == 1:
-                draft = torch.full((1, T), int(first_token_id), dtype=torch.int32, device="cuda:0")
-            elif fwd > 1:
-                draft = dl.get_next_draft_tokens(0).reshape(1, T)
-            dl.forward(draft)
-            n_acc = dl.get_num_accepted(0)
-            pred = dl.get_predicted_tokens(0).flatten()
-            if fwd == 0:
-                fwd += 1
-                continue
-            accepted.append(n_acc)
-            fwd += 1
-            for i in range(n_acc):
-                if len(tokens) >= budget:
-                    break
-                tok = int(pred[i].item())
-                if tok in stop_ids:
+        # Feed the prefill-sampled first token to the matcher before any masked
+        # step (see _decode_standard); a violation here fails closed (400).
+        finished = False
+        if grammar_session is not None:
+            try:
+                if grammar_session.accept(int(first_token_id)) == "terminated":
                     finished = True
-                    finish = "stop"
+            except RuntimeError as e:
+                raise GrammarViolationError(
+                    f"prefill first token {first_token_id} violates the " f"grammar"
+                ) from e
+        dl.set_prefill_valid_tokens(0)
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
+        ar_ok = hasattr(dl, "ar_accepted_tokens") and hasattr(dl, "ar_num_accepted")
+        draft = torch.full((1, T), int(self._last_prompt_token), dtype=torch.int32, device="cuda:0")
+        accepted, finish, fwd = [], "length", 0
+        grammar_mask_written = False
+        try:
+            while not finished and len(tokens) < budget:
+                if cancel_event is not None and cancel_event.is_set():
+                    finish = "cancelled"
                     break
-                tokens.append(tok)
-                if on_token:
-                    on_token(tok)
-        dl.reset_sequence()
+                if fwd == 1:
+                    draft = torch.full(
+                        (1, T), int(first_token_id), dtype=torch.int32, device="cuda:0"
+                    )
+                elif fwd > 1:
+                    draft = dl.get_next_draft_tokens(0).reshape(1, T)
+                # Publish this step's per-verify-position mask BEFORE forward
+                # (synchronous path; forward-型, so no show_hands overlap).
+                # fwd==0 is a discarded warmup -> never masked. The draft chain
+                # (row j+1 accepts draft[:j]) mirrors the verified tokens;
+                # at fwd==1 the all-first_token placeholder yields n_acc==1, so
+                # the deeper rows are don't-care. Dormant never follows an
+                # active step (activation is one-way), so no mid-stream reset.
+                if grammar_session is not None and fwd >= 1 and not grammar_session.terminated:
+                    chain = draft[0, 1:].cpu().tolist()
+                    masks = grammar_session.fill_step_masks(chain)
+                    if masks is not None:
+                        dl.update_grammar_bitmask(masks)
+                        grammar_mask_written = True
+                if fwd == 0 or grammar_session is not None or not ar_ok:
+                    steps = 1
+                else:
+                    rem = budget - len(tokens)
+                    steps = max(1, min(ar_steps, -(-rem // T)))
+                if ar_ok:
+                    dl.show_hands(draft, steps)
+                    acc = dl.ar_accepted_tokens(0).cpu()[0]
+                    num = dl.ar_num_accepted(0).cpu()[0]
+                    n_tokens = int(acc[0].item())
+                    n_steps = int(num[0].item())
+                    emitted = acc[1 : 1 + n_tokens].tolist()
+                    per_step = num[1 : 1 + n_steps].tolist()
+                else:
+                    dl.forward(draft)
+                    n_acc = dl.get_num_accepted(0)
+                    pred = dl.get_predicted_tokens(0).flatten()
+                    emitted = [int(pred[i].item()) for i in range(n_acc)]
+                    per_step = [n_acc]
+                if fwd == 0:
+                    fwd += 1
+                    continue
+                fwd += 1
+                offset = 0
+                for na in per_step:
+                    step_emit = emitted[offset : offset + na]
+                    offset += na
+                    for tok in step_emit:
+                        if len(tokens) >= budget:
+                            break
+                        tok = int(tok)
+                        if tok in stop_ids:
+                            finished = True
+                            finish = "stop"
+                            break
+                        tokens.append(tok)
+                        if on_token:
+                            on_token(tok)
+                        if (
+                            grammar_session is not None
+                            and grammar_session.accept(tok) == "terminated"
+                        ):
+                            finished = True
+                            finish = "stop"
+                            break
+                    accepted.append(na)
+                    if finished or len(tokens) >= budget:
+                        break
+        finally:
+            if grammar_mask_written:
+                dl.reset_grammar_bitmask()
+            dl.reset_sequence()
         self.last_stats = {
             "finish_reason": finish,
             "mtp_accept_mean": round(sum(accepted) / max(1, len(accepted)), 3),
@@ -449,11 +704,11 @@ class MlaNsaEngineAdapter:
         }
         return tokens
 
-    def _decode_standard(self, first_token_id, budget, on_token, cancel_event):
-        from tilert.models.deepseek_v3_2.temp_var_indices import Idx
-
+    def _decode_standard(
+        self, first_token_id, budget, on_token, cancel_event, grammar_session=None
+    ):
         dl = self.gen.decode_layer
-        stop_ids = self.stop_ids
+        stop_ids = set() if self._ignore_eos else self.stop_ids
         torch = self._torch
         tokens = [int(first_token_id)]
         if on_token:
@@ -462,23 +717,91 @@ class MlaNsaEngineAdapter:
             self.last_stats = {"finish_reason": "stop"}
             return []
         finish = "length"
-        cur = torch.tensor(int(first_token_id), dtype=torch.long, device="cuda:0")
-        while len(tokens) < budget:
-            if cancel_event is not None and cancel_event.is_set():
-                finish = "cancelled"
-                break
-            res = dl.forward(cur)
-            intermediates, *_ = res[0]
-            nxt = intermediates[Idx.TOKEN_OUT][0][0]
-            tok = int(nxt.item())
-            if tok in stop_ids:
-                finish = "stop"
-                break
-            tokens.append(tok)
-            if on_token:
-                on_token(tok)
-            cur = nxt
-        dl.reset_sequence()
+        finished = False
+        grammar_mask_written = False
+        ar_ok = hasattr(dl, "show_hands_no_mtp") and hasattr(dl, "ar_accepted_tokens_no_mtp")
+        ar_steps = max(1, min(1024, int(os.environ.get("GLM5_AR_N", "8"))))
+        cur = last_tok = None
+        prev = None
+        if ar_ok:
+            dl.set_prefill_valid_tokens(0, with_mtp=False)
+            last_tok = int(first_token_id)
+            prev = torch.tensor([last_tok], dtype=torch.int32, device="cuda:0")
+        else:
+            cur = torch.tensor(int(first_token_id), dtype=torch.long, device="cuda:0")
+        try:
+            # Feed the prefill-sampled first token to the matcher before the
+            # first masked step. Its origin is the UNCONSTRAINED prefill, so it
+            # may legitimately violate the grammar (thinking dormant never
+            # rejects) -> fail closed with a client 400.
+            if grammar_session is not None:
+                try:
+                    if grammar_session.accept(int(first_token_id)) == "terminated":
+                        finish, finished = "stop", True
+                except RuntimeError as e:
+                    raise GrammarViolationError(
+                        f"prefill first token {first_token_id} violates the " f"grammar"
+                    ) from e
+            while not finished and len(tokens) < budget:
+                if cancel_event is not None and cancel_event.is_set():
+                    finish = "cancelled"
+                    break
+                # Publish the row-0 mask for the token this step will sample
+                # (matcher is at the post-committed state). Dormant/terminated
+                # steps return None -> device stays allow-all (no write).
+                if (
+                    grammar_session is not None
+                    and grammar_session.active
+                    and not grammar_session.terminated
+                ):
+                    masks = grammar_session.fill_step_masks([])
+                    if masks is not None:
+                        dl.update_grammar_bitmask(masks)
+                        grammar_mask_written = True
+                if ar_ok:
+                    steps = (
+                        1
+                        if grammar_session is not None
+                        else max(1, min(ar_steps, budget - len(tokens)))
+                    )
+                    dl.show_hands_no_mtp(prev, steps)
+                    acc = dl.ar_accepted_tokens_no_mtp(0).cpu()[0]
+                    n_tokens = int(acc[0].item())
+                    emitted = acc[1 : 1 + n_tokens].tolist()
+                else:
+                    from tilert.models.deepseek_v3_2.temp_var_indices import Idx
+
+                    res = dl.forward(cur)
+                    intermediates, *_ = res[0]
+                    nxt = intermediates[Idx.TOKEN_OUT][0][0]
+                    emitted = [int(nxt.item())]
+                    cur = nxt
+                for tok in emitted:
+                    if len(tokens) >= budget:
+                        break
+                    tok = int(tok)
+                    if tok in stop_ids:
+                        finished = True
+                        finish = "stop"
+                        break
+                    tokens.append(tok)
+                    last_tok = tok
+                    if on_token:
+                        on_token(tok)
+                    if grammar_session is not None and grammar_session.accept(tok) == "terminated":
+                        finished = True
+                        finish = "stop"
+                        break
+                if ar_ok:
+                    prev = torch.tensor([last_tok], dtype=torch.int32, device="cuda:0")
+        finally:
+            if grammar_mask_written:
+                # Restore the all-ones no-op mask so later unconstrained
+                # requests on this generator sample the full vocabulary.
+                dl.reset_grammar_bitmask()
+            # Always reset the decode-layer sequence, even on a fail-closed
+            # violation, so the next request starts from a clean state.
+            dl.reset_sequence()
         self.last_stats = {"finish_reason": finish}
         return tokens
 

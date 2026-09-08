@@ -34,6 +34,11 @@ ignore =
 per-file-ignores =
     __init__.py:F401
     tests/*:D100,D101,D102,D103
+    # pd_vllm tests are built from test doubles that mirror the real signatures
+    # (U100/U101), stack ``with`` blocks for readability (SIM117), and carry
+    # rationale docstrings that open with an identifier or run one sentence
+    # over several lines (D205/D210/D403).
+    tests/pd_vllm/*:D205,D210,D403,U100,U101,SIM117,R504,VNE002
     setup.py:D100,D101,D102,D103,B009
     # pd_vllm implements vLLM connector / abstract-profile interfaces, so many
     # method params are unused by design (U100); black collapses the ``...``

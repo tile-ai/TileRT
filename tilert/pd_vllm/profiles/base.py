@@ -4,8 +4,18 @@ The framework (prefill connector plumbing, receive server + control plane,
 decode server orchestration, router) is model-agnostic and calls into the
 active profile for the parts that differ between models:
 
-  GLM-5         : replicated MLA latent KV + NSA KI index + MTP draft
-  DeepSeek-V3.2 : replicated MLA latent KV + NSA KI index + MTP draft
+  GLM-5 / GLM-5.2 / GLM-5.3 : replicated MLA latent KV + NSA KI index + MTP draft
+  DeepSeek-V3.2             : replicated MLA latent KV + NSA KI index + MTP draft
+
+A profile owns four concerns:
+  1. receive-buffer layout (decode node) + hello fields advertising it
+  2. prefill-side extraction (kv_caches -> staged bytes) + the RDMA plan
+  3. decode-side convert (received bytes -> native tensors) + inject
+  4. engine construction + decode loop (MTP style differs per model)
+
+Registration returned by ``classify_layers`` and ``sections`` returned by
+``extract`` are opaque profile-internal objects threaded back by the
+framework — they never cross the profile boundary interpreted.
 """
 
 from __future__ import annotations
@@ -16,6 +26,9 @@ from typing import Any, Protocol
 class ModelProfile(Protocol):
     name: str
     num_ranks: int
+    # TP ranks that actually RDMA-send (the framework counts `done` against
+    # this set and skips extraction on other ranks). MLA-family profiles: {0}
+    # (the MLA latent is replicated across TP).
     sender_ranks: frozenset
 
     @property
@@ -64,12 +77,33 @@ class ModelProfile(Protocol):
     ) -> Any:
         """Construct the decode engine adapter (inject/decode/reset)."""
 
+    # ── optional hooks (checked with hasattr; not every profile has them) ─
+    # configure(kv_cache_dtype)      : MLA family — cache dtype sizes the buffer
+    # configure_weights(weights_dir) : members whose depth comes from the
+    #                                  checkpoint; called on the decode node
+    #                                  BEFORE buffer_bytes/hello_layout.
+    # declares_penalties: bool       : whether the decode runtime implements
+    #                                  repetition/presence penalties. Read by
+    #                                  the router at startup (no engine exists
+    #                                  yet to ask); absent means "no".
+
 
 _REGISTRY: dict[str, ModelProfile] = {}
 _ALIASES = {
     "glm5": "glm5",
     "glm_5": "glm5",
     "glm-5": "glm5",
+    "glm5_2": "glm5_2",
+    "glm_5_2": "glm5_2",
+    "glm-5.2": "glm5_2",
+    "glm5.2": "glm5_2",
+    "glm52": "glm5_2",
+    # GLM-5.3 shares GLM-5.2's base model, config and PD data plane.
+    "glm5_3": "glm5_2",
+    "glm_5_3": "glm5_2",
+    "glm-5.3": "glm5_2",
+    "glm5.3": "glm5_2",
+    "glm53": "glm5_2",
     "dsv32": "dsv32",
     "deepseek_v3_2": "dsv32",
     "deepseek-v3.2": "dsv32",
@@ -88,6 +122,8 @@ def get_profile(name: str) -> ModelProfile:
         # lazy import so a profile's heavy deps load only when selected
         if canon == "glm5":
             from tilert.pd_vllm.profiles import glm5  # noqa: F401
+        elif canon == "glm5_2":
+            from tilert.pd_vllm.profiles import glm5_2  # noqa: F401
         elif canon == "dsv32":
             from tilert.pd_vllm.profiles import dsv32  # noqa: F401
     if canon not in _REGISTRY:
