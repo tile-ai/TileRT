@@ -11,6 +11,7 @@ from tilert.models.deepseek_v3_2.model_args import ModelArgs
 from tilert.models.deepseek_v3_2.modules.end2end import ShowHandsDSALayer
 from tilert.models.deepseek_v3_2.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
+from tilert.utils import copy_by_device_pair
 
 __all__ = [
     "DSAv32Generator",
@@ -463,6 +464,7 @@ class DSAv32Generator:
 
         num_devices = self.decode_layer.num_devices
 
+        copies = []
         for device_id in range(num_devices):
             _, caches, _, _ = self.decode_layer._get_device_result(device_id)
 
@@ -473,13 +475,11 @@ class DSAv32Generator:
 
                 base_idx = layer_id * 3
 
-                ki_src = ki[:cache_len].to(f"cuda:{device_id}")
-                kv_src = kv[:cache_len].to(f"cuda:{device_id}")
-                pe_src = pe[:cache_len].to(f"cuda:{device_id}")
+                for _off, _src in ((0, ki), (1, kv), (2, pe)):
+                    _dst = caches[base_idx + _off][0, start_pos:end_pos, :]
+                    copies.append((_dst, _src[:cache_len]))
 
-                caches[base_idx + 0][0, start_pos:end_pos, :].copy_(ki_src)
-                caches[base_idx + 1][0, start_pos:end_pos, :].copy_(kv_src)
-                caches[base_idx + 2][0, start_pos:end_pos, :].copy_(pe_src)
+        copy_by_device_pair(copies, self.__dict__.setdefault("_inject_streams", {}))
 
         logger.info(f"Cache injection completed for {num_devices} devices")
 

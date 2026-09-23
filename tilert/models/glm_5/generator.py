@@ -11,6 +11,7 @@ from tilert.models.glm_5._dsa_v32.model_args import ModelArgs
 from tilert.models.glm_5.modules.end2end import ShowHandsDSALayer
 from tilert.models.glm_5.temp_var_indices import Idx
 from tilert.tilert_init import tilert_init
+from tilert.utils import copy_by_device_pair
 
 __all__ = [
     "GLM5Generator",
@@ -457,6 +458,7 @@ class GLM5Generator:
 
         num_devices = self.decode_layer.num_devices
 
+        copies = []
         for device_id in range(num_devices):
             _, caches, _, _ = self.decode_layer._get_device_result(device_id)
 
@@ -467,17 +469,13 @@ class GLM5Generator:
 
                 base_idx = layer_id * 3
 
-                ki_src = ki[:cache_len].to(f"cuda:{device_id}")
-                kv_src = kv[:cache_len].to(f"cuda:{device_id}")
-                pe_src = pe[:cache_len].to(f"cuda:{device_id}")
-
-                for _off, _src in ((0, ki_src), (1, kv_src), (2, pe_src)):
+                for _off, _src in ((0, ki), (1, kv), (2, pe)):
                     _dst = caches[base_idx + _off]
                     if _dst.size(1) < end_pos:
                         continue
-                    _dst[0, start_pos:end_pos, :].copy_(_src)
+                    copies.append((_dst[0, start_pos:end_pos, :], _src[:cache_len]))
 
-            torch.cuda.synchronize(device_id)
+        copy_by_device_pair(copies, self.__dict__.setdefault("_inject_streams", {}))
 
         logger.info(f"Cache injection completed for {num_devices} devices")
 

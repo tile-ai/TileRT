@@ -88,3 +88,50 @@ def relative_l2_error(gt: torch.Tensor, out: torch.Tensor) -> Any:
         The relative L2 error.
     """
     return torch.norm(gt - out) / torch.norm(gt)
+
+
+def copy_by_device_pair(
+    copies: list[tuple[torch.Tensor, torch.Tensor]],
+    streams: dict[tuple[int, int], torch.cuda.Stream],
+) -> None:
+    """Run ``dst.copy_(src)`` for every pair, one stream pair per device pair.
+
+    torch fences a cross-device ``copy_`` against the current stream of both
+    devices, so issuing many cache copies on the default streams runs them one
+    at a time over a single link. Grouping them by (destination, source) device
+    and giving each group its own streams lets the pairs overlap. ``streams``
+    caches the streams between calls. Returns after every copy has finished.
+
+    Args:
+        copies: (destination, source) tensor pairs. Destinations must be CUDA
+            tensors; sources may be CUDA or CPU tensors.
+        streams: Cache of streams keyed by (device, peer device).
+    """
+
+    def stream(dev: int, peer: int) -> torch.cuda.Stream:
+        key = (dev, peer)
+        if key not in streams:
+            streams[key] = torch.cuda.Stream(device=dev)
+        return streams[key]
+
+    by_pair: dict[tuple[int, int], list[tuple[torch.Tensor, torch.Tensor]]] = {}
+    for dst, src in copies:
+        src_dev = src.device.index if src.is_cuda else -1
+        by_pair.setdefault((dst.device.index, src_dev), []).append((dst, src))
+    devices = set()
+    for (dst_dev, src_dev), group in by_pair.items():
+        devices.add(dst_dev)
+        dst_stream = stream(dst_dev, src_dev)
+        if src_dev < 0:
+            with torch.cuda.stream(dst_stream):
+                for dst, src in group:
+                    dst.copy_(src, non_blocking=True)
+            continue
+        devices.add(src_dev)
+        with torch.cuda.stream(dst_stream), torch.cuda.stream(stream(src_dev, dst_dev)):
+            for dst, src in group:
+                dst.copy_(src, non_blocking=True)
+    for st in streams.values():
+        st.synchronize()
+    for dev in devices:
+        torch.cuda.synchronize(dev)
