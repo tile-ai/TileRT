@@ -8,8 +8,8 @@
 #
 # The recommended path remains the prebuilt Docker image (see README).
 torch==2.11.0
-transformers==4.46.3
-tokenizers==0.20.3
+transformers>=4.46.3
+tokenizers>=0.20.3
 numpy
 scipy
 einops

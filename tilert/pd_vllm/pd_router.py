@@ -4,7 +4,8 @@ Does OpenAI-semantics output parsing (reasoning + tool calls), streaming and
 non-streaming.
 
 Flow per request (phase-1 hybrid, see design doc):
-  1. pick a free decode node (in-memory busy tracking; all busy -> 429)
+  1. pick a free decode node (in-memory busy tracking; all busy -> wait up to
+     --queue-timeout, then 429)
   2. forward to vLLM with max_tokens=1 + logprobs and inject
      kv_transfer_params {tilert_host, tilert_ctrl_port} — the connector
      claims the request and RDMA-sends state to the decode node
@@ -40,6 +41,8 @@ from tilert.pd_vllm.wire import derive_rid
 
 logger = logging.getLogger("pd_vllm.router")
 
+QUEUE_LOG_SECONDS = 0.1
+
 
 class DecodeNode:
     def __init__(self, host: str, ctrl_port: int, http_port: int):
@@ -54,21 +57,31 @@ class DecodeNode:
 
 
 class Pool:
-    def __init__(self, nodes: list[DecodeNode]):
+    """Decode-node reservation; ``queue_timeout`` > 0 waits instead of failing fast."""
+
+    def __init__(self, nodes: list[DecodeNode], queue_timeout: float = 0.0):
         self.nodes = nodes
-        self._lock = threading.Lock()
+        self.queue_timeout = queue_timeout
+        self._cv = threading.Condition()
 
     def acquire(self) -> DecodeNode | None:
-        with self._lock:
-            for n in self.nodes:
-                if not n.busy:
-                    n.busy = True
-                    return n
-        return None
+        """Reserve a node, or None once ``queue_timeout`` elapses."""
+        deadline = time.monotonic() + self.queue_timeout
+        with self._cv:
+            while True:
+                for n in self.nodes:
+                    if not n.busy:
+                        n.busy = True
+                        return n
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cv.wait(remaining)
 
     def release(self, node: DecodeNode) -> None:
-        with self._lock:
+        with self._cv:
             node.busy = False
+            self._cv.notify()
 
 
 def first_token_from_logprobs(resp: dict, is_chat: bool) -> int:
@@ -97,6 +110,37 @@ def _thinking_enabled(body: dict) -> bool:
     return bool(ctk.get("enable_thinking", True))
 
 
+# Client fields that must not survive into the prefill request, which is
+# forwarded verbatim apart from the fields we set: stream_options contradicts
+# the stream=False we force (vLLM rejects the pair with a 400 during body
+# parsing), and max_completion_tokens takes precedence over max_tokens, so it
+# would override our max_tokens=1. Streaming clients send both.
+_PREFILL_DROP_FIELDS = ("stream_options", "max_completion_tokens")
+
+
+def build_prefill_body(path: str, body: dict, node: DecodeNode) -> dict:
+    """The vLLM request that prefills only and hands the KV state to ``node``.
+
+    Lives outside ``build_app`` so the rewrite can be exercised without a
+    router process, a vLLM instance or a decode node.
+    """
+    prefill_body = dict(body)
+    prefill_body["max_tokens"] = 1
+    prefill_body["stream"] = False
+    for field in _PREFILL_DROP_FIELDS:
+        prefill_body.pop(field, None)
+    if path.endswith("chat/completions"):
+        prefill_body["logprobs"] = True
+        prefill_body["top_logprobs"] = 1
+    else:
+        prefill_body["logprobs"] = 1
+    prefill_body["kv_transfer_params"] = {
+        "tilert_host": node.host,
+        "tilert_ctrl_port": node.ctrl_port,
+    }
+    return prefill_body
+
+
 class RouterCtx:
     """Immutable per-process context (tokenizer, parser factory, config)."""
 
@@ -123,6 +167,24 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     app = FastAPI()
     pool = ctx.pool
 
+    def _acquire_node() -> tuple[DecodeNode | None, float]:
+        """Reserve a node, and report how long the caller queued for it."""
+        t0 = time.monotonic()
+        node = pool.acquire()
+        waited = time.monotonic() - t0
+        if node is not None and waited >= QUEUE_LOG_SECONDS:
+            logger.info("queued %.1fs for decode node %s", waited, node.host)
+        return node, waited
+
+    def _busy_response(waited: float) -> JSONResponse:
+        """429 body, distinguishing a full pool from an exhausted queue timeout."""
+        detail = (
+            f"no decode node free after waiting {waited:.1f}s"
+            if pool.queue_timeout > 0
+            else "all decode nodes busy"
+        )
+        return JSONResponse({"error": detail}, status_code=429)
+
     @app.get("/health")
     def health():
         return {"status": "ok", "decode_free": sum(1 for n in pool.nodes if not n.busy)}
@@ -133,24 +195,13 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     # ── shared prefill step ──────────────────────────────────────────────
     def _prefill(path, body, node):
-        prefill_body = dict(body)
-        prefill_body["max_tokens"] = 1
-        prefill_body["stream"] = False
-        if path.endswith("chat/completions"):
-            prefill_body["logprobs"] = True
-            prefill_body["top_logprobs"] = 1
-        else:
-            prefill_body["logprobs"] = 1
-        prefill_body["kv_transfer_params"] = {
-            "tilert_host": node.host,
-            "tilert_ctrl_port": node.ctrl_port,
-        }
+        prefill_body = build_prefill_body(path, body, node)
         r = requests.post(f"{ctx.vllm_url}{path}", json=prefill_body, timeout=600)
         r.raise_for_status()
         return r.json()
 
     def _sampling_of(body):
-        return {k: body[k] for k in ("temperature", "top_p", "top_k") if k in body}
+        return {k: body[k] for k in ("temperature", "top_p", "top_k", "ignore_eos") if k in body}
 
     def _max_tokens_of(body):
         return int(body.get("max_tokens") or body.get("max_completion_tokens") or 256)
@@ -158,9 +209,9 @@ def build_app(ctx: RouterCtx) -> FastAPI:
     # ── non-streaming ────────────────────────────────────────────────────
     def _handle(path: str, body: dict):
         is_chat = path.endswith("chat/completions")
-        node = pool.acquire()
+        node, waited = _acquire_node()
         if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
+            return _busy_response(waited)
         t0 = time.time()
         try:
             prefill = _prefill(path, body, node)
@@ -235,20 +286,29 @@ def build_app(ctx: RouterCtx) -> FastAPI:
 
     # ── streaming (chat only) ────────────────────────────────────────────
     async def _handle_stream(path: str, body: dict, request: Request):
+        import anyio
         from starlette.concurrency import run_in_threadpool
 
-        node = pool.acquire()
-        if node is None:
-            return JSONResponse({"error": "all decode nodes busy"}, status_code=429)
-
+        node = None  # reserved inside the try: both handlers below release it
         try:
+            # Shielded: a disconnect must not strand a reservation mid-acquire.
+            with anyio.CancelScope(shield=True):
+                node, waited = await run_in_threadpool(_acquire_node)
+            if node is None:
+                return _busy_response(waited)
             prefill = await run_in_threadpool(_prefill, path, body, node)
             rid = derive_rid(prefill["id"])
             first_token_id = first_token_from_logprobs(prefill, True)
         except Exception as e:
-            pool.release(node)
+            if node is not None:
+                pool.release(node)
             logger.exception("pd stream request failed before streaming")
             return JSONResponse({"error": str(e)}, status_code=502)
+        except BaseException:
+            # CancelledError is not an Exception; without this the node stays busy.
+            if node is not None:
+                pool.release(node)
+            raise
 
         chunk_id = prefill["id"]
         model = prefill.get("model")
@@ -265,6 +325,17 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             }
             if usage is not None:
                 payload["usage"] = usage
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def _usage_chunk(usage: dict) -> str:
+            payload = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
             return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
         def _event_delta(ev: dict) -> dict:
@@ -303,8 +374,14 @@ def build_app(ctx: RouterCtx) -> FastAPI:
             detok = IncrementalDetok(ctx.tokenizer)
             sess = parser.stream() if parser else None
             client = httpx.AsyncClient(timeout=httpx.Timeout(600, read=600))
+            role_sent = False
+
+            def _role_once():
+                nonlocal role_sent
+                role_sent = True
+                return _chunk({"role": "assistant"})
+
             try:
-                yield _chunk({"role": "assistant"})
                 async with client.stream(
                     "POST",
                     f"{node.http_base}/pd/decode",
@@ -333,6 +410,8 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                             text = detok.push(msg["t"])
                             if not text:
                                 continue
+                            if not role_sent:
+                                yield _role_once()
                             if sess is None:
                                 yield _chunk({"content": text})
                                 continue
@@ -340,13 +419,18 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                                 if ev["kind"] == "tool":
                                     saw_tool = True
                                 yield _chunk(_event_delta(ev))
-                        elif "done" in msg:
+                        # R508 false positive: https://github.com/afonasev/flake8-return/issues/137
+                        elif "done" in msg:  # noqa: R508
                             finish_reason = msg.get("finish_reason", "stop")
                             if finish_reason == "cancelled":
                                 finish_reason = "stop"
+                            break
                         elif "error" in msg:
+                            if not role_sent:
+                                yield _role_once()
                             yield _chunk({"content": f"\n[decode error: {msg['error']}]"})
                             finish_reason = "stop"
+                            break
                 if client_gone:
                     logger.info("client gone mid-stream for %s", rid)
                     return  # finally fires the cancel
@@ -357,13 +441,15 @@ def build_app(ctx: RouterCtx) -> FastAPI:
                         yield _chunk(_event_delta(ev))
                 if saw_tool:
                     finish_reason = "tool_calls"
-                yield _chunk(
-                    {},
-                    finish=finish_reason,
-                    usage={
+                if not role_sent:
+                    yield _role_once()
+                yield _chunk({}, finish=finish_reason)
+                yield _usage_chunk(
+                    {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": n_tokens,
-                    },
+                        "total_tokens": (prompt_tokens or 0) + n_tokens,
+                    }
                 )
                 yield "data: [DONE]\n\n"
                 completed_ok = True
@@ -425,6 +511,12 @@ def main() -> None:
         default="glm47",
         help="output parser (reasoning + tool calls)",
     )
+    ap.add_argument(
+        "--queue-timeout",
+        type=float,
+        default=0.0,
+        help="seconds to wait for a free decode node before answering 429 (0: fail fast)",
+    )
     args = ap.parse_args()
 
     nodes = []
@@ -440,7 +532,7 @@ def main() -> None:
             args.model_path, trust_remote_code=True
         )  # nosec B615
 
-    ctx = RouterCtx(args.vllm_url, Pool(nodes), tokenizer, args.parser)
+    ctx = RouterCtx(args.vllm_url, Pool(nodes, args.queue_timeout), tokenizer, args.parser)
     app = build_app(ctx)
     logger.info(
         "router on :%d -> vllm=%s, %d decode node(s), parser=%s",

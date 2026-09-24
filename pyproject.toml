@@ -20,8 +20,8 @@ dependencies = [
     # https://download.pytorch.org/whl/cu130``); installing from PyPI yields a
     # CUDA build that does not match the cu130-linked tilert binary.
     "torch==2.11.0",
-    "transformers==4.46.3",
-    "tokenizers==0.20.3",
+    "transformers>=4.46.3",
+    "tokenizers>=0.20.3",
     "numpy",
     "scipy",
     "einops",

@@ -7,14 +7,22 @@ only pins the layer count, wire version, and the GLM5Generator engine build.
 
 from __future__ import annotations
 
+import os
+
 from tilert.pd_vllm.profiles import base
 from tilert.pd_vllm.profiles.mla_nsa import (
     MlaNsaEngineAdapter,
     MlaNsaProfile,
 )
 
-NUM_LAYERS = 79  # 78 main + 1 MTP draft
-LAYOUT_VERSION = 10  # glm5 wire family
+_NO_MTP = (os.environ.get("TILERT_PD_NO_MTP") or "0").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+NUM_LAYERS = 78 if _NO_MTP else 79  # 78 main + 1 MTP draft
+LAYOUT_VERSION = 1010 if _NO_MTP else 10  # glm5 wire family
 
 
 def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):

@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import queue as queue_mod
 import socket
 import threading
@@ -31,6 +32,9 @@ from pydantic import BaseModel
 from tilert.pd_vllm.receive_server import ReceiveServer
 
 logger = logging.getLogger("pd_vllm.decode_server")
+
+
+DECODE_POLL_S = max(0.0, float(os.environ.get("TILERT_DECODE_POLL_MS") or "200")) / 1000.0
 
 
 class DecodeBody(BaseModel):
@@ -176,6 +180,12 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
         # streaming: ndjson lines {"t":[ids...]}* then {"done":true,...};
         # lock/engine ownership transfers to the generator.
         q: queue_mod.Queue = queue_mod.Queue()
+        fin: dict = {"loop": None, "ev": None}
+
+        def _signal_done() -> None:
+            loop, ev = fin["loop"], fin["ev"]
+            if loop is not None and ev is not None:
+                loop.call_soon_threadsafe(ev.set)
 
         def _run():
             try:
@@ -187,9 +197,11 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
                     cancel_event=cancel,
                 )
                 q.put(("done", tokens))
+                _signal_done()
             except Exception as e:  # pragma: no cover
                 logger.exception("stream decode failed for %s", body.rid)
                 q.put(("error", str(e)))
+                _signal_done()
 
         worker = threading.Thread(target=_run, name="pd-decode", daemon=True)
 
@@ -204,11 +216,28 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
             import anyio
             from starlette.concurrency import run_in_threadpool
 
+            fin["loop"] = asyncio.get_running_loop()
+            fin["ev"] = asyncio.Event()
             worker.start()
             try:
                 batch: list[int] = []
                 done_msg = None
                 last_activity = time.time()
+                while done_msg is None:
+                    try:
+                        first = q.get_nowait()
+                    except queue_mod.Empty:
+                        if time.time() - last_activity > 600:
+                            yield json.dumps({"error": "decode stalled"}) + "\n"
+                            return
+                        await asyncio.sleep(0.001)
+                        continue
+                    if isinstance(first, int):
+                        yield json.dumps({"t": [first]}) + "\n"
+                    else:
+                        done_msg = first
+                    last_activity = time.time()
+                    break
                 while done_msg is None:
                     drained = False
                     while True:
@@ -232,7 +261,8 @@ def build_app(server: ReceiveServer, engine) -> FastAPI:
                             yield json.dumps({"error": "decode stalled"}) + "\n"
                             return
                         else:
-                            await asyncio.sleep(0.005)
+                            with contextlib.suppress(TimeoutError):
+                                await asyncio.wait_for(fin["ev"].wait(), timeout=DECODE_POLL_S)
                 kind, payload = done_msg
                 if kind == "done":
                     timing = {
