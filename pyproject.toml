@@ -15,19 +15,30 @@ classifiers = [
 ]
 
 dependencies = [
-    # Pinned to the exact ABI the v0.1.5 wheel was built against. ``torch`` must
-    # come from PyTorch's cu130 index (``--index-url
-    # https://download.pytorch.org/whl/cu130``); installing from PyPI yields a
-    # CUDA build that does not match the cu130-linked tilert binary.
-    "torch==2.11.0",
+    # The v0.1.6 wheel carries backends for two torch ABIs, hence the range:
+    # the CUDA backends (DeepSeek-V3.2, GLM-5) need ``torch==2.11.0+cu130``
+    # from PyTorch's cu130 index (``--index-url
+    # https://download.pytorch.org/whl/cu130``), the ROCm backend (GLM-5.2/5.3)
+    # needs ``torch==2.12.0+rocm7.14.0``. ``tilert.load_backend`` refuses a
+    # torch of the wrong version or flavor, so install the matching one first.
+    "torch>=2.11,<2.13",
     "transformers>=4.46.3",
     "tokenizers>=0.20.3",
+    "safetensors",
     "numpy",
     "scipy",
     "einops",
 ]
 
 [project.optional-dependencies]
+# Runtime dependencies of the PD router and decode server (``tilert.pd_vllm``).
+pd = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "requests",
+    "pydantic",
+]
 dev = [
     "pytest>=7.0.0",
     "black==25.1.0",
@@ -65,7 +76,10 @@ dev = [
 Homepage = "https://github.com/tile-ai/TileRT"
 Issues = "https://github.com/tile-ai/TileRT/issues"
 
-# Note: this repository ships the public sources that match the v0.1.5 wheel.
+# Note: this repository ships the public Python sources of the v0.1.6.post2
+# wheel. They are recovered from the wheel itself, which ships them without
+# docstrings or comments, and reformatted to this repo's lint config;
+# ``tilert/generate.py`` also carries a CLI fix that no published wheel has yet.
 # The wheel itself is built in the development repo (TileRT-dev/TileRT) with
 # scikit-build-core; no [build-system] block is declared here on purpose so
 # nobody accidentally runs ``pip wheel .`` against this presentation copy.
@@ -113,13 +127,41 @@ explicit_package_bases = true
 
 # pd_vllm is glue over vLLM's connector API; its interface methods take
 # ``Any``-typed params by contract, so full def-level annotation is low value.
-# Relax annotation-completeness there, but keep real type checks (arg-type,
-# union-attr, etc.) on so genuine mistakes still surface.
+# Relax annotation-completeness there. Since v0.1.6 the sources are recovered
+# from the published wheel, which ships them without comments, so per-line
+# ``# type: ignore``s are not available either: the error codes that occur in
+# the exported code are disabled, and the remaining checks still apply.
 [[tool.mypy.overrides]]
 module = "tilert.pd_vllm.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 warn_return_any = false
+disable_error_code = [
+    "arg-type",
+    "assignment",
+    "attr-defined",
+    "func-returns-value",
+    "index",
+    "misc",
+    "return-value",
+    "type-var",
+    "union-attr",
+    "unreachable",
+    "var-annotated",
+]
+
+# The ROCm port (GLM-5.2/5.3 on MI350X/MI355X) comes from the same wheel export.
+[[tool.mypy.overrides]]
+module = [
+    "tilert.models.glm_5_2_rocm.*",
+    "tilert.models.misc_rocm.*",
+    "tilert.models.base_rocm",
+    "tilert.models.common_mxfp4",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+warn_return_any = false
+disable_error_code = ["assignment", "attr-defined", "dict-item", "index", "union-attr"]
 
 [tool.bandit]
 exclude_dirs = ["tests", "3rd-party"]
@@ -202,7 +244,7 @@ args = ["--keep-percent-format", "--py311-plus"]
 [tool.codespell]
 skip = "3rd-party,*.git,*.pyc,build,dist,*.egg-info,.mypy_cache,.pytest_cache,"
 check-hidden = true
-ignore-words-list = "ThrID"
+ignore-words-list = "ThrID,pres"
 
 [tool.mdformat]
 number = true

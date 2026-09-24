@@ -20,7 +20,9 @@ ______________________________________________________________________
 
 ## 📰 News
 
-- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5.post3) Released**. Introduce [**PD (prefill–decode) disaggregation**](https://www.tilert.ai/blog/tilert-vllm-disaggregation.html) — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5/5.1 and DeepSeek-V3.2.
+- 🏆 **2026-09-24 · [TileRT Takes the Top Spot on AgentX](https://www.tilert.ai/blog/tilert-amd-agentx.html)**. On SemiAnalysis's InferenceX **AgentX** leaderboard, TileRT powers **GLM-5.3** to **469 tok/s** of single-user generation on **million-token agent sessions** with **8× AMD Instinct MI355X** — **#1 in single-user performance**. Running the original **FP8** weights, it leads the second-place NVIDIA GB300 NVL72 FP4 submission by more than 100 tok/s. [v0.1.6](https://github.com/tile-ai/TileRT/releases/tag/v0.1.6.post2) brings ROCm support to the public release: GLM-5.2/5.3 on AMD Instinct MI350X/MI355X.
+
+- 🔀 **2026-07-14 · [v0.1.5](https://github.com/tile-ai/TileRT/releases/tag/v0.1.5.post2) Released**. Introduce [**PD (prefill–decode) disaggregation**](https://www.tilert.ai/blog/tilert-vllm-disaggregation.html) — vLLM prefill + TileRT decode, behind an OpenAI-compatible endpoint. Supported on GLM-5/5.1 and DeepSeek-V3.2.
 
 - 💥 **2026-06-08 · [Breaking 1000 TPS on a 1T Model](https://www.tilert.ai/blog/breaking-1000-tps.html)**. In collaboration with [Xiaomi MiMo](https://mimo.xiaomi.com/blog/mimo-tilert-1000tps), TileRT pushes [**MiMo-V2.5-Pro-UltraSpeed**](https://platform.xiaomimimo.com/docs/en-US/model-intro/mimo-v2.5-pro-ultraspeed) past **1000 tokens/s** on a **1-trillion-parameter** model through extreme model–system co-design — a first without custom silicon, all on a single 8-GPU node.
 
@@ -56,9 +58,9 @@ To achieve this, TileRT introduces a **tile-level runtime engine**. Leveraging a
 The project is actively evolving, and the underlying compiler techniques will be gradually shared with the community as they are integrated into **TileLang** and **TileScale**.
 
 <p align="center">
-  <img src="assets/glm5_tilert_mtp.png" width="640" alt="GLM-5.1-FP8 token generation speed on 8× B200 with TileRT v0.1.5"/>
+  <img src="assets/glm5_3fp8_benchmark.png" width="760" alt="GLM-5.2/5.3-FP8 token generation speed on 8× MI350X with TileRT v0.1.6"/>
   <br/>
-  <sub><em>GLM-5.1-FP8 token generation speed on 8× NVIDIA B200 with TileRT v0.1.5. Output length 1K, input length 1K–192K. Bars compare TileRT without MTP, with MTP at average acceptance length 3.2, and the peak under best-case MTP acceptance (4.0).</em></sub>
+  <sub><em>GLM-5.2/5.3-FP8 token generation speed on 8× AMD Instinct MI350X with TileRT v0.1.6 (greedy decoding, bf16 KV and indexer caches). Output length 1K, input length 1K–1M. Bars compare TileRT without MTP, with MTP at depth 3 and average acceptance length 3.2, and the peak under best-case MTP acceptance (4.0).</em></sub>
 </p>
 
 ______________________________________________________________________
@@ -66,28 +68,31 @@ ______________________________________________________________________
 ## Installation
 
 > \[!IMPORTANT\]
-> TileRT v0.1.5 is distributed as a **pre-built binary wheel**. The wheel is linked against the exact ABI of the versions listed below. Other combinations of Python, CUDA, or PyTorch versions are **untested and not guaranteed to work** — please reproduce this environment for a supported setup.
+> TileRT v0.1.6 is distributed as a **pre-built binary wheel** that carries three backends: two CUDA backends (DeepSeek-V3.2, GLM-5/5.1) and one ROCm backend (GLM-5.2/5.3). Each backend is linked against the exact PyTorch ABI listed below, and `tilert.load_backend()` refuses a PyTorch of the wrong version or flavor (CUDA vs ROCm). Other combinations of Python, CUDA/ROCm, or PyTorch versions are **untested and not guaranteed to work** — please reproduce this environment for a supported setup.
 
-### Build environment of the v0.1.5 wheel
+### Build environment of the v0.1.6 wheel
 
-The official `tilert==0.1.5.post3` wheel on PyPI was compiled against the following stack. Treat these as **hard requirements**, not lower bounds (`transformers` / `tokenizers` are lower bounds since v0.1.5.post2).
+The official `tilert==0.1.6.post2` wheel on PyPI was compiled against the following stacks. Treat these as **hard requirements**, not lower bounds (`transformers` / `tokenizers` are lower bounds).
 
-| Component        | Pinned version                                      |
-| ---------------- | --------------------------------------------------- |
-| GPU              | 8× NVIDIA **B200**                                  |
-| NVIDIA driver    | Supports **CUDA 13.2** runtime                      |
-| Operating System | Linux **x86_64**, glibc **≥ 2.28** (manylinux_2_28) |
-| Python           | **3.12**                                            |
-| PyTorch          | **`torch==2.11.0+cu130`**                           |
-| `transformers`   | **`>= 4.46.3`**                                     |
-| `tokenizers`     | **`>= 0.20.3`**                                     |
+| Component        | NVIDIA — DeepSeek-V3.2, GLM-5/5.1                   | AMD — GLM-5.2/5.3                                   |
+| ---------------- | --------------------------------------------------- | --------------------------------------------------- |
+| GPU              | 8× NVIDIA **B200**                                  | 8× AMD Instinct **MI350X** / **MI355X**             |
+| Driver / runtime | NVIDIA driver supporting the **CUDA 13.2** runtime  | **ROCm 7.14.0**                                     |
+| Operating System | Linux **x86_64**, glibc **≥ 2.28** (manylinux_2_28) | Linux **x86_64**, glibc **≥ 2.28** (manylinux_2_28) |
+| Python           | **3.12**                                            | **3.12**                                            |
+| PyTorch          | **`torch==2.11.0+cu130`**                           | **`torch==2.12.0+rocm7.14.0`**                      |
+| `transformers`   | **`>= 4.46.3`**                                     | **`>= 4.46.3`**                                     |
+| `tokenizers`     | **`>= 0.20.3`**                                     | **`>= 0.20.3`**                                     |
 
-### Recommended: pre-built Docker image
+### Recommended: pre-built Docker images
 
-The pinned build environment above is preinstalled in our official image
-— this is the **recommended way to run v0.1.5** and avoids any version
-drift on the host. The image is mirrored to two registries; pull from
-whichever is reachable:
+The pinned build environments above are preinstalled in our official
+images — this is the **recommended way to run v0.1.6** and avoids any
+version drift on the host.
+
+**NVIDIA (B200).** The image is mirrored to two registries; pull from
+whichever is reachable, then launch a container with all 8 B200 GPUs
+attached:
 
 ```bash
 # GitHub Container Registry
@@ -95,29 +100,45 @@ docker pull ghcr.io/tile-ai/tilert:cu132-latest
 
 # Docker Hub
 docker pull tileai/tilert:cu132-latest
-```
 
-Launch a container with all 8 B200 GPUs attached, then install the
-wheel inside:
-
-```bash
 docker run --rm -it --gpus all --ipc=host \
     -v "$PWD":/workspace -w /workspace \
     ghcr.io/tile-ai/tilert:cu132-latest
+```
 
-# Inside the container — install from PyPI:
-pip install tilert==0.1.5.post3
+**AMD (MI350X / MI355X).** Pull the ROCm image and launch a container with the
+GPUs attached:
+
+```bash
+docker pull ghcr.io/tile-ai/tilert-rocm-decode:0.1.6
+
+docker run --rm -it --ipc=host \
+    --device=/dev/kfd --device=/dev/dri --group-add video \
+    -v "$PWD":/workspace -w /workspace \
+    ghcr.io/tile-ai/tilert-rocm-decode:0.1.6
+```
+
+The ROCm image sets `HF_HUB_OFFLINE=1`; run `unset HF_HUB_OFFLINE` before
+downloading a checkpoint from inside the container.
+
+Inside either container, install the wheel. It accepts both PyTorch builds
+(`torch>=2.11,<2.13`), so pip keeps the one preinstalled in the image:
+
+```bash
+# From PyPI:
+pip install tilert==0.1.6.post2
 
 # Or pin the exact wheel from the GitHub Release page directly
 # (same artifact, useful when PyPI is unreachable):
-pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.5.post3/tilert-0.1.5.post3-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install https://github.com/tile-ai/TileRT/releases/download/v0.1.6.post2/tilert-0.1.6.post2-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
 
 Verify the install:
 
 ```bash
-python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__, '/ cuda', torch.version.cuda)"
-# Expected: tilert 0.1.5.post3 / torch 2.11.0+cu130 / cuda 13.0
+python -c "import tilert, torch; print('tilert', tilert.__version__, '/ torch', torch.__version__)"
+# NVIDIA — expected: tilert 0.1.6.post2 / torch 2.11.0+cu130
+# AMD    — expected: tilert 0.1.6.post2 / torch 2.12.0+rocm7.14.0
 ```
 
 Proceed to [Getting Started](#getting-started) to download and convert model weights.
@@ -130,11 +151,12 @@ Starting from release v0.1.3, TileRT no longer requires downloading pre-converte
 
 ### Step 2: Shard Weights with `weight_converter`
 
-The converter ships inside the `tilert` wheel. It rewrites the official HF
-checkpoint into TileRT's per-device layout — 8 shards, one per B200, with
-keys suffixed `*_dev_{0..7}` and a fresh `model.safetensors.index.json`.
-The runtime loads these shards directly; the original checkpoint is no
-longer needed after conversion.
+The converters ship inside the `tilert` wheel. For the NVIDIA models,
+`weight_converter` rewrites the official HF checkpoint into TileRT's
+per-device layout — 8 shards, one per B200, with keys suffixed
+`*_dev_{0..7}` and a fresh `model.safetensors.index.json`. The runtime
+loads these shards directly; the original checkpoint is no longer needed
+after conversion.
 
 For **DeepSeek-V3.2**:
 
@@ -154,35 +176,51 @@ python -m tilert.models.preprocess.weight_converter \
   --save_dir "/path/to/GLM-5-FP8-TileRT"
 ```
 
+For **GLM-5.2/5.3** (AMD MI350X / MI355X), the ROCm port has its own converter:
+
+```bash
+python -m tilert.models.glm_5_2_rocm.weight_converter \
+  --model_dir "/path/to/GLM-5.2-FP8" \
+  --save_dir "/path/to/GLM-5.2-FP8-TileRT" \
+  --num_mtp 1
+```
+
+`--num_mtp 1` also converts the MTP module, which MTP decoding needs;
+leave it out to convert the base model only.
+
 `--model_dir` is the directory of the downloaded HF checkpoint;
 `--save_dir` is where the sharded TileRT-format weights will land.
 
-### Step 3: Register the Sharded Weights Path
-
-Either pass `--model-weights-dir <path>` on every `tilert.generate`
-invocation, or register the path once in `~/.tilert/config.toml` so the
-CLI picks it up automatically:
-
-```toml
-[weights]
-deepseek_v3_2 = "/path/to/DeepSeek-V3.2-TileRT"
-glm5          = "/path/to/GLM-5-FP8-TileRT"
-```
-
 ### Running the Generation Example
 
-The simplest entry point is the bundled CLI. Pick `--model deepseek_v3_2`
-or `--model glm5`; weights resolve from `~/.tilert/config.toml` or from
-an explicit `--model-weights-dir`:
+The simplest entry point is the bundled CLI. Pick `--model deepseek_v3_2`,
+`--model glm5`, or `--model glm5_2_rocm`, and point `--model-weights-dir`
+(required) at the converted weights:
 
 ```bash
-python -m tilert.generate --model deepseek_v3_2 --max-new-tokens 1000
+python -m tilert.generate --model glm5_2_rocm \
+    --model-weights-dir /path/to/GLM-5.2-FP8-TileRT \
+    --prompt "Tell me three jokes." --max-new-tokens 1000
 ```
 
+On AMD, `--max-seq-len` (default 8192) sets the KV-cache length; the
+NVIDIA models take it from their model args.
+
+> \[!WARNING\]
+> In the published `tilert==0.1.6.post2` wheel, the CLI fails for the
+> NVIDIA models (`--model deepseek_v3_2` / `--model glm5`) once the weights
+> are loaded, with
+> `TypeError: generate() got an unexpected keyword argument 'max_new_tokens'`.
+> The fix is in this repository's [`tilert/generate.py`](tilert/generate.py)
+> but not yet in a published wheel; until it is, drive the NVIDIA models
+> through the Python API below.
+
 > \[!NOTE\]
-> v0.1.5 ships **two independent backend libraries** (`libtilert_dsv32.so`
-> and `libtilert_glm5.so`) and loads exactly one per Python process via
-> `tilert.load_backend(model_type)`. Run DeepSeek-V3.2 and GLM-5 in
+> v0.1.6 ships **three independent backend libraries** —
+> `libtilert_dsv32.so` and `libtilert_glm5.so` (CUDA), and
+> `libtilert_glm52_rocm.so` (ROCm) — and loads exactly one per Python
+> process via `tilert.load_backend(model_type)`, which also checks the
+> running PyTorch's version and flavor (CUDA vs ROCm). Run different models in
 > separate processes — they cannot coexist in a single interpreter.
 
 To drive generation programmatically, load the backend first, then build
@@ -219,7 +257,10 @@ completion = generator.generate(prompt)
 
 (For **GLM-5**, swap in `tilert.load_backend("glm5")` and
 `from tilert.models.glm_5.generator import GLM5Generator` with
-`ModelArgsGLM5`.)
+`ModelArgsGLM5`. For **GLM-5.2/5.3** on AMD, use
+`tilert.load_backend("glm5_2_rocm")` and
+`from tilert.models.glm_5_2_rocm.generator import Glm52Generator` with
+`ModelArgsGlm52`; it takes `num_mtp=` (0, 1 or 3) instead of `with_mtp=`.)
 
 For example, TileRT may generate:
 
@@ -238,11 +279,17 @@ This example demonstrates basic single-step autoregressive generation using the 
 
 ### Running the Generation Example with Multi-Token Prediction (MTP)
 
-TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth. Enable it from the CLI with `--with-mtp`:
+TileRT also supports Multi-Token Prediction (MTP), which allows the model to generate multiple tokens per forward pass and reduces sequential decoding depth. Enable it from the CLI with `--num-mtp`, the draft depth (`0`, the default, disables it):
 
 ```bash
-python -m tilert.generate --model deepseek_v3_2 --with-mtp --max-new-tokens 1000
+python -m tilert.generate --model glm5_2_rocm \
+    --model-weights-dir /path/to/GLM-5.2-FP8-TileRT \
+    --num-mtp 3 --max-new-tokens 1000
 ```
+
+GLM-5.2/5.3 run MTP at depth 1 or 3 and need weights converted with
+`--num_mtp 1`; the NVIDIA models run any `--num-mtp` above 0 at their
+fixed depth of 3.
 
 Or programmatically, pass `with_mtp=True` to the generator:
 
@@ -306,7 +353,7 @@ Of course! Here are 10 short jokes for you.
 
 This example highlights how MTP enables TileRT to efficiently generate longer outputs by accepting multiple tokens per decoding step, while preserving the same Python API interface.
 
-For the full list of CLI flags (sampling, batching, benchmark modes, …), run `python -m tilert.generate --help`.
+For the full list of CLI flags (prompt files, sampling, MTP depth, …), run `python -m tilert.generate --help`.
 
 ## Disaggregated Serving: vLLM Prefill + TileRT Decode
 
@@ -316,10 +363,11 @@ TileRT can run as the **decode engine behind a vLLM prefill**, integrated throug
 
 - Convert the model weights for TileRT decode (see [Step 2](#step-2-shard-weights-with-weight_converter)).
 - On the **prefill** node, a vLLM build with V1 disaggregation and support for the GLM-5/5.1 / DeepSeek-V3.2 (DSA) model and the `fp8_ds_mla` KV-cache dtype. Install `tilert` in the same environment so the connector plugin is importable.
+- On the **decode** and **router** hosts, install `tilert` with the `pd` extra: `pip install "tilert[pd]==0.1.6.post2"` pulls in FastAPI, Uvicorn, HTTPX, Requests and Pydantic.
 - **The KV-cache dtype must match on both ends.** These examples use fp8: `--kv-cache-dtype fp8_ds_mla` on the vLLM prefill and `--kv-cache-dtype fp8` on the TileRT decode (a mismatch is rejected at the connector handshake).
 - The examples use the **NIXL** transfer engine. On multi-NIC hosts, pin NIXL to the RDMA NICs via `UCX_NET_DEVICES` (otherwise UCX may pick the wrong interface). Mooncake is also supported (`--transport mooncake` on the decode, `"tilert_transport": "mooncake"` on the prefill).
 
-Commands below use GLM-5/5.1. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`.
+Commands below use GLM-5/5.1. For DeepSeek-V3.2, use `--model deepseek_v3_2`, the DeepSeek-V3.2-TileRT weights, and `--parser none`. For GLM-5.2/5.3 on AMD MI350X / MI355X, the decode server's `--model glm5_2` profile (`glm5_3` is accepted as an alias) runs the ROCm engine; start that decode node from the ROCm image.
 
 ### Topology A: vLLM prefill → TileRT decode
 
@@ -364,6 +412,10 @@ python -m tilert.pd_vllm.pd_router \
 Send OpenAI requests to `http://<router>:23333/v1/chat/completions`. The router runs the prefill on vLLM (first token), hands the attention state to the TileRT decode node over RDMA, and streams the completion back.
 
 A decode engine serves one sequence at a time, so the router reserves a node per request and answers `429` while they are all busy. Add `--queue-timeout <seconds>` to make a request wait for a free node instead of failing: useful when a single client fans out into concurrent sub-conversations — an agentic session spawning sub-agents, say — and the burst is wider than the pool but short-lived. Waits longer than 0.1 s are logged. The default, `0`, keeps the fail-fast behaviour.
+
+The router resolves sampling defaults the way vLLM does: `--generation-config auto` (the default) reads `generation_config.json` under `--model-path`, `--generation-config vllm` uses neutral defaults, and `--default-temperature` / `--default-top-p` / `--default-top-k` override single values. The resolved values are sent explicitly to both the prefill and the decode leg, so the two cannot disagree. Decode nodes advertise what they support (logprobs, penalties, `ignore_eos`), and a request that asks for something its node cannot honour is rejected with an error.
+
+On the decode node, `--pd-buffer-device cpu` keeps the PD receive buffer in pinned host memory registered with the transport: it frees VRAM at the cost of one extra host-to-device copy per request. The default is `cuda`; `TILERT_PD_BUFFER_DEVICE` sets it too.
 
 ### Topology B: shared prefill → TileRT decode **and** native vLLM decode
 

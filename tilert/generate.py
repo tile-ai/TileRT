@@ -1,299 +1,172 @@
-"""Text generation script for TileRT."""
+"""TileRT offline generation CLI."""
 
+import argparse
+import importlib.util
+import sys
 import time
-from argparse import ArgumentParser
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import Any
+
+import torch
 
 import tilert
 
-if TYPE_CHECKING:
-    from tilert.models.deepseek_v3_2.generator import DSAv32Generator
-    from tilert.models.glm_5.generator import GLM5Generator
-from tilert.benchmark import BenchMode
-from tilert.benchmark import coding_prompt as coding_bench
-from tilert.benchmark import long_prompt as long_bench
-from tilert.benchmark import merge_stats, print_summary_table
-from tilert.benchmark import short_prompt as short_bench
-from tilert.benchmark.config import get_weights_dir
+_MODEL_PACKAGES: dict[str, str] = {
+    "deepseek_v3_2": "tilert.models.deepseek_v3_2",
+    "glm5": "tilert.models.glm_5",
+    "glm5_2_rocm": "tilert.models.glm_5_2_rocm",
+}
 
 
-def get_generator(
-    model_type: str,
-    max_new_tokens: int,
-    temperature: float,
-    model_weights_dir: str,
-    with_mtp: bool,
-    top_p: float = 0.9,
-    top_k: int = 256,
-    enable_thinking: bool = False,
-    sampling_seed: int = 42,
-) -> "DSAv32Generator | GLM5Generator":
-    """Load the matching backend .so and build the generator for ``model_type``.
+def _release_products() -> set[str] | None:
+    try:
+        op = torch.ops.tilert.supported_models.default
+        keyset = torch._C.DispatchKeySet(torch._C.DispatchKey.CPU)
+        return set(op.redispatch(keyset))
+    except Exception:
+        return None
 
-    DeepSeek-V3.2 and GLM-5 ship as separate libraries; only one backend loads
-    per process. Generators are imported lazily after the backend is loaded.
-    """
-    tilert.load_backend(model_type)
 
-    if model_type == "deepseek_v3_2":
-        from tilert.models.deepseek_v3_2.generator import DSAv32Generator
-        from tilert.models.deepseek_v3_2.model_args import ModelArgs as DSAv32ModelArgs
+def available_models() -> list[str]:
+    present = [
+        model
+        for model, package in _MODEL_PACKAGES.items()
+        if importlib.util.find_spec(package) is not None
+    ]
+    products = _release_products()
+    if products is None:
+        return present
+    filtered = [m for m in present if _MODEL_PACKAGES[m].rsplit(".", 1)[-1] in products]
+    return filtered or present
 
-        return DSAv32Generator(
-            model_args=DSAv32ModelArgs(),
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            model_weights_dir=model_weights_dir,
-            with_mtp=with_mtp,
-            top_p=top_p,
-            top_k=top_k,
-            use_topp=top_p < 1.0,
-            sampling_seed=sampling_seed,
-            enable_thinking=enable_thinking,
+
+def get_generator(model: str, weights_dir: str, args: argparse.Namespace) -> Any:
+    tilert.load_backend(model)
+    use_topp = args.top_p < 1.0
+    if model == "glm5_2_rocm":
+        from tilert.models.glm_5_2_rocm.generator import Glm52Generator
+        from tilert.models.glm_5_2_rocm.model_args import ModelArgsGlm52
+
+        return Glm52Generator(
+            model_args=ModelArgsGlm52(),
+            model_weights_dir=weights_dir,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            use_topp=use_topp,
+            sampling_seed=args.sampling_seed,
+            num_mtp=args.num_mtp,
+            max_seq_len=args.max_seq_len,
         )
-
-    if model_type == "glm5":
+    if model == "glm5":
         from tilert.models.glm_5.generator import GLM5Generator
         from tilert.models.glm_5.model_args import ModelArgsGLM5
 
         return GLM5Generator(
             model_args=ModelArgsGLM5(),
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            model_weights_dir=model_weights_dir,
-            with_mtp=with_mtp,
-            top_p=top_p,
-            top_k=top_k,
-            use_topp=top_p < 1.0,
-            enable_thinking=enable_thinking,
-            sampling_seed=sampling_seed,
+            model_weights_dir=weights_dir,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            use_topp=use_topp,
+            sampling_seed=args.sampling_seed,
+            with_mtp=args.num_mtp > 0,
         )
+    if model == "deepseek_v3_2":
+        from tilert.models.deepseek_v3_2.generator import DSAv32Generator
+        from tilert.models.deepseek_v3_2.model_args import ModelArgs
 
-    raise ValueError(f"unsupported model_type: {model_type!r}")
+        return DSAv32Generator(
+            model_args=ModelArgs(),
+            model_weights_dir=weights_dir,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            use_topp=use_topp,
+            sampling_seed=args.sampling_seed,
+            enable_thinking=args.enable_thinking,
+            with_mtp=args.num_mtp > 0,
+        )
+    raise SystemExit(
+        f"[generate] model {model!r} is not offered by this build; available: {available_models()}"
+    )
 
 
-def parse_args():  # type: ignore
-    parser = ArgumentParser(description="Command-line interface for text generation.")
-    parser.add_argument(
-        "--model-weights-dir",
-        type=str,
-        default=None,
-        help="Path to model weights directory (resolved from ~/.tilert/config.toml if omitted)",
+def _prompts(args: argparse.Namespace) -> list[str]:
+    if args.prompt_file:
+        text = Path(args.prompt_file).read_text(encoding="utf-8")
+        out = [p.strip() for p in text.split("\n\n") if p.strip()]
+        if not out:
+            raise SystemExit(f"[generate] no prompts in {args.prompt_file}")
+        return out
+    return [args.prompt]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    models = available_models()
+    if not models:
+        raise SystemExit(
+            "[generate] this install ships no model package; the engine library may have failed to load (see the warning from `import tilert`)"
+        )
+    p = argparse.ArgumentParser(
+        prog="python -m tilert.generate", description=__doc__.splitlines()[0]
     )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="deepseek_v3_2",
-        choices=["deepseek_v3_2", "glm5"],
-        help="Model type to use (default: deepseek_v3_2).",
+    p.add_argument("--model", choices=models, default=models[0])
+    p.add_argument("--model-weights-dir", required=True, help="converted weights dir")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--prompt", default="Hello! Tell me about yourself.")
+    src.add_argument(
+        "--prompt-file", help="file of prompts, separated by blank lines; each is generated in turn"
     )
-    parser.add_argument("--max-new-tokens", type=int, default=4000, help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument(
-        "--top-p",
-        type=float,
-        default=1.0,
-        help="Top-p (nucleus) sampling threshold. Use < 1.0 to enable top-p sampling (e.g. 0.9)",
-    )
-    parser.add_argument("--top-k", type=int, default=256, help="Top-k sampling threshold")
-    parser.add_argument("--interactive", action="store_true")
-    parser.add_argument(
-        "--with-mtp",
-        action="store_true",
-        help="Enable MTP (Multi-Token Prediction) for speculative decoding",
-    )
-    parser.add_argument(
-        "--use-random-weights",
-        action="store_true",
-        help="Use random weights instead of pretrained (for testing MTP without real weights)",
-    )
-    parser.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        help="Enable thinking mode in chat template",
-    )
-    parser.add_argument(
-        "--sampling-seed",
+    p.add_argument("--max-new-tokens", type=int, default=200)
+    p.add_argument(
+        "--max-seq-len",
         type=int,
-        default=42,
-        help="Sampling seed for top-p sampling (fixed per request, default: 42)",
+        default=8192,
+        help="KV cache length; honoured by the ROCm models (the CUDA ones take it from their model args)",
     )
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default=None,
-        help="Override display name for benchmark tables",
+    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--top-p", type=float, default=0.95, help="1.0 selects greedy (argmax) decoding")
+    p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--sampling-seed", type=int, default=42)
+    p.add_argument(
+        "--num-mtp", type=int, default=0, help="MTP draft depth; 0 disables speculative decoding"
     )
-    parser.add_argument(
-        "--tag",
-        type=str,
-        default=None,
-        help="Tag for regression_plots/ directory (default: auto-detect from git state)",
-    )
-    parser.add_argument(
-        "--modes",
-        type=str,
-        default=None,
-        help="Comma-separated mode filters: top-k1,top-p0.95 (default: all)",
-    )
-    parser.add_argument(
-        "--workloads",
-        type=str,
-        default=None,
-        help="Comma-separated workload filters: short,coding,long (default: all)",
-    )
-    parser.add_argument(
-        "--enable-logprobs",
-        action="store_true",
-        help="Enable kernel-level top-256 logprobs export (for benchmarking overhead)",
-    )
-    return parser.parse_args()
+    p.add_argument("--enable-thinking", action="store_true")
+    p.add_argument("--quiet", action="store_true", help="only print completions")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    prompts = _prompts(args)
+    t0 = time.monotonic()
+    generator = get_generator(args.model, args.model_weights_dir, args)
+    generator.init()
+    generator.from_pretrained()
+    if not args.quiet:
+        print(f"[generate] {args.model} loaded in {time.monotonic() - t0:.1f}s")
+    try:
+        for i, prompt in enumerate(prompts):
+            if not args.quiet:
+                print(f"\n=== prompt {i + 1}/{len(prompts)} ===\n{prompt}\n--- output ---")
+            t = time.monotonic()
+            text, times, accepts, prompt_len = generator.generate(prompt, print_log=False)
+            wall = time.monotonic() - t
+            print(text)
+            if not args.quiet:
+                n_tok = sum(accepts) if accepts else len(times)
+                rate = n_tok / wall if wall > 0 else 0.0
+                line = f"[generate] {prompt_len} prompt tok -> {n_tok} tok in {wall:.1f}s ({rate:.1f} tok/s)"
+                if accepts:
+                    line += f", mean accept {sum(accepts) / len(accepts):.2f}"
+                print(line)
+    finally:
+        generator.cleanup()
+    return 0
 
 
 if __name__ == "__main__":
-    """
-    Usage (run as a module; --model-weights-dir may be omitted if the path is
-    registered under ~/.tilert/config.toml). Run DeepSeek-V3.2 and GLM-5 in
-    separate processes — the two backends cannot coexist in one interpreter.
-
-    # DeepSeek-V3.2 — standard generation with pretrained weights:
-    python -m tilert.generate --model deepseek_v3_2 \
-        --model-weights-dir /path/to/DeepSeek-V3.2-TileRT \
-        --max-new-tokens 1000 2>&1 | tee test.log
-
-    # DeepSeek-V3.2 — MTP generation with random weights (for testing):
-    python -m tilert.generate --model deepseek_v3_2 --with-mtp --use-random-weights \
-        --model-weights-dir /path/to/DeepSeek-V3.2-TileRT \
-        --max-new-tokens 1000 2>&1 | tee test.log
-
-    # DeepSeek-V3.2 — MTP generation with pretrained weights:
-    python -m tilert.generate --model deepseek_v3_2 --with-mtp \
-        --model-weights-dir /path/to/DeepSeek-V3.2-TileRT \
-        --max-new-tokens 1000 2>&1 | tee test.log
-
-    # GLM-5 — standard generation:
-    python -m tilert.generate --model glm5 \
-        --model-weights-dir /path/to/GLM-5-FP8-TileRT \
-        --max-new-tokens 1000 2>&1 | tee test.log
-
-    # GLM-5 — MTP generation:
-    python -m tilert.generate --model glm5 --with-mtp \
-        --model-weights-dir /path/to/GLM-5-FP8-TileRT \
-        --max-new-tokens 1000 2>&1 | tee test.log
-    """
-    args = parse_args()
-
-    config_key = args.model
-    model_name = args.model.upper()
-    if args.model_name:
-        model_name = args.model_name
-    model_weights_dir = get_weights_dir(config_key, cli_override=args.model_weights_dir)
-
-    if args.interactive:
-        with_mtp = args.with_mtp
-    else:
-        with_mtp = True
-
-    generator = get_generator(
-        model_type=args.model,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        model_weights_dir=model_weights_dir,
-        with_mtp=with_mtp,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        enable_thinking=args.enable_thinking,
-        sampling_seed=args.sampling_seed,
-    )
-
-    t0 = time.monotonic()
-    if args.use_random_weights:
-        print("Initializing random weights...")
-        if hasattr(generator, "init"):
-            generator.init()  # type: ignore[union-attr]
-        generator.init_random_weights()
-    else:
-        print("Loading pretrained weights...")
-        generator.from_pretrained()
-    load_time = time.monotonic() - t0
-
-    if args.enable_logprobs:
-        if hasattr(generator.decode_layer, "set_logprobs_enabled"):
-            generator.decode_layer.set_logprobs_enabled(True)  # type: ignore[union-attr]
-            print("Logprobs export enabled (top-256)")
-        else:
-            print(f"Warning: logprobs not supported for {type(generator).__name__}")
-
-    if args.interactive:
-        print("Welcome to the TileRT interactive mode! Type '/exit' to exit.")
-        while True:
-            prompt = input(">>> ")
-            if prompt == "/exit":
-                break
-            _ = generator.generate(prompt)  # type: ignore[has-type]
-    else:
-
-        bench_top_p = args.top_p if args.top_p < 1.0 else 0.95
-        modes = [
-            BenchMode(with_mtp=False, label="top-k1 w/o MTP"),
-            BenchMode(with_mtp=True, label="top-k1 w/ MTP"),
-            BenchMode(
-                with_mtp=True,
-                label=f"top-p{bench_top_p} w/ MTP",
-                use_topp=True,
-                top_p=bench_top_p,
-                top_k=args.top_k,
-                temperature=args.temperature,
-            ),
-        ]
-
-        if args.modes:
-            allowed = {m.strip() for m in args.modes.split(",")}
-            modes = [m for m in modes if any(a in m.label for a in allowed)]
-            if not modes:
-                raise SystemExit(
-                    f"Error: --modes '{args.modes}' matched no benchmark modes. "
-                    f"Valid tokens: top-k1, top-p0.95"
-                )
-
-        t0 = time.monotonic()
-        workload_runners = []
-        allowed_workloads = (
-            {w.strip() for w in args.workloads.split(",")}
-            if args.workloads
-            else {"short", "coding", "long"}
-        )
-        if "short" in allowed_workloads:
-            workload_runners.append(short_bench.run)
-        if "coding" in allowed_workloads:
-            workload_runners.append(coding_bench.run)
-        if "long" in allowed_workloads:
-            workload_runners.append(long_bench.run)
-        if not workload_runners:
-            raise SystemExit(
-                f"Error: --workloads '{args.workloads}' matched no workloads. "
-                f"Valid values: short, coding, long"
-            )
-
-        all_bench_results = [
-            runner(generator, modes) for runner in workload_runners  # type: ignore[arg-type]
-        ]
-        bench_time = time.monotonic() - t0
-        all_bench_stats = [stats for stats, _ in all_bench_results]
-
-        print_summary_table(
-            merge_stats(all_bench_stats),
-            model_name=model_name,
-        )
-
-        total = load_time + bench_time
-        print(f"\n## {model_name} Timing")
-        print()
-        print("| Phase | Time |")
-        print("|-------|------|")
-        print(f"| Loading | {load_time:.1f}s |")
-        print(f"| Benchmark | {bench_time:.1f}s |")
-        print(f"| **Total** | **{total:.1f}s** |")
-
-    print("Cleaning up...")
-    generator.cleanup()
+    sys.exit(main())

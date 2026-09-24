@@ -1,19 +1,9 @@
-"""GLM-5 profile — thin config over the shared MLA+NSA data plane.
-
-GLM-5 = 79 cache layers (78 main + 1 MTP draft), MLA latent KV + NSA KI index.
-All layout / convert / extract / RDMA logic lives in ``mla_nsa``; this file
-only pins the layer count, wire version, and the GLM5Generator engine build.
-"""
-
 from __future__ import annotations
 
 import os
 
 from tilert.pd_vllm.profiles import base
-from tilert.pd_vllm.profiles.mla_nsa import (
-    MlaNsaEngineAdapter,
-    MlaNsaProfile,
-)
+from tilert.pd_vllm.profiles.mla_nsa import MlaNsaEngineAdapter, MlaNsaProfile
 
 _NO_MTP = (os.environ.get("TILERT_PD_NO_MTP") or "0").strip().lower() not in (
     "0",
@@ -21,15 +11,13 @@ _NO_MTP = (os.environ.get("TILERT_PD_NO_MTP") or "0").strip().lower() not in (
     "no",
     "off",
 )
-NUM_LAYERS = 78 if _NO_MTP else 79  # 78 main + 1 MTP draft
-LAYOUT_VERSION = 1010 if _NO_MTP else 10  # glm5 wire family
+NUM_LAYERS = 78 if _NO_MTP else 79
+LAYOUT_VERSION = 1010 if _NO_MTP else 10
 
 
 def _build_engine(model_weights_dir, max_seq_len, with_mtp, ar_steps):
     import tilert
 
-    # multi-backend builds (tilert>=0.1.x) load the per-model .so on demand;
-    # single-backend builds auto-register on import and lack load_backend.
     if hasattr(tilert, "load_backend"):
         tilert.load_backend("glm5")
     from tilert.models.glm_5.generator import GLM5Generator
