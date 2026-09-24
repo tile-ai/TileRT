@@ -7,6 +7,10 @@
 # Especially: transformers MUST be 4.46.3. The 5.x branch is not backward
 # compatible with TileRT's tokenizer/model loading paths.
 #
+# The image also carries the AWS EFA userspace stack (libfabric + rdma-core);
+# see the "AWS EFA userspace stack" section below for the run-time requirements,
+# or build with --build-arg INSTALL_EFA=0 to leave it out.
+#
 # Build:
 #   docker build -t tileai/tilert:cu132-v0.1.4 .
 # Pull pre-built:
@@ -14,6 +18,9 @@
 # Use:
 #   docker run --rm --gpus all -v $PWD:/workspace -w /workspace \
 #     tileai/tilert:cu132-v0.1.4 make wheel BUILD_TYPE=Release
+# Use with EFA:
+#   docker run --rm --gpus all --device /dev/infiniband --ulimit memlock=-1 \
+#     -v $PWD:/workspace -w /workspace tileai/tilert:cu132-v0.1.4 fi_info -p efa
 
 FROM pytorch/manylinux2_28-builder:cuda13.2-main
 
@@ -107,6 +114,65 @@ ENV TORCH_CUDA_ARCH_LIST="10.0" \
     SKBUILD_CMAKE_DEFINE="USER_CUDA_ARCH_LIST=10.0" \
     CMAKE_BUILD_PARALLEL_LEVEL=16 \
     PATH="/opt/conda/envs/tilert/bin:/opt/conda/bin:${PATH}"
+
+# ── AWS EFA userspace stack ──────────────────────────────────────────────────
+#
+# Installs libfabric (with the EFA provider) + rdma-core into /opt/amazon/efa.
+# Userspace only:
+#
+#   --skip-kmod        the efa kernel driver belongs to the host, not the image
+#   --skip-limit-conf  memlock limits are a host/`docker run --ulimit` concern
+#   --no-verify        no EFA device is present during the build
+#   --mpi none         TileRT needs libfabric, not Open MPI (drop this flag if
+#                      you want openmpi4/5 under /opt/amazon/openmpi*)
+#
+# At run time the host must have the efa kernel module loaded, and the container
+# needs the devices plus unlimited memlock, e.g.:
+#   docker run --gpus all --device /dev/infiniband --ulimit memlock=-1 ...
+#
+# Pinned by version + sha256; bump both together.
+#
+# Two details about running the installer here:
+#  - It sources ./env.sh and ./common.sh relatively, so it must be run from its
+#    own directory.
+#  - Its supported-OS check matches NAME/VERSION_ID in /etc/os-release against a
+#    fixed list (RHEL, Rocky, AL2023, SUSE, Debian, Ubuntu) and exits with
+#    "Unsupported operating system" on anything else. This base is AlmaLinux 8,
+#    which it does not recognise even though the RPMS/ROCKYLINUX8 set it ships
+#    is plain el8 and ABI-correct here. The block below patches the extracted
+#    (throwaway) common.sh to add AlmaLinux 8 as a supported OS and get
+#    unblocked.
+ARG INSTALL_EFA=1
+ARG EFA_INSTALLER_VERSION=1.50.0
+ARG EFA_INSTALLER_SHA256=fa6dff8593d866866c13cb4640d9059835cd4efa427971f100ab40c97bef2841
+RUN if [ "${INSTALL_EFA}" = "1" ]; then \
+        set -euo pipefail; \
+        command -v curl >/dev/null || yum install -y --setopt=install_weak_deps=False curl; \
+        archive="/tmp/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"; \
+        curl -fsSL --retry 3 --retry-all-errors \
+            "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+            -o "${archive}"; \
+        echo "${EFA_INSTALLER_SHA256}  ${archive}" | sha256sum -c -; \
+        tar -xzf "${archive}" -C /tmp; \
+        sed -i '/^is_rockylinux_8()/,/^}/ s/\[ "$NAME" = "Rocky Linux" \]/[ "$NAME" = "Rocky Linux" -o "$NAME" = "AlmaLinux" ]/' \
+            /tmp/aws-efa-installer/common.sh; \
+        grep -q '"AlmaLinux"' /tmp/aws-efa-installer/common.sh; \
+        bash -n /tmp/aws-efa-installer/common.sh; \
+        echo "WARNING: AlmaLinux is not on the EFA installer supported-OS list." >&2; \
+        echo "WARNING: patched common.sh to accept it as Rocky Linux 8; the RPMS/ROCKYLINUX8 packages it installs are plain el8." >&2; \
+        echo "NOTE: userspace install only; the EFA kernel driver and memlock limits stay with the host." >&2; \
+        (cd /tmp/aws-efa-installer && \
+            ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify --mpi none); \
+        ldconfig; \
+        test -x /opt/amazon/efa/bin/fi_info; \
+        /opt/amazon/efa/bin/fi_info --version; \
+        rm -rf "${archive}" /tmp/aws-efa-installer; \
+        yum clean all && rm -rf /var/cache/yum; \
+    fi
+
+# fi_info and friends on PATH; the installer drops /etc/ld.so.conf.d/000_efa.conf
+# so libfabric.so resolves through ldconfig without LD_LIBRARY_PATH.
+ENV PATH="${PATH}:/opt/amazon/efa/bin"
 
 # ── Shell activation + entrypoint ─────────────────────────────────────────────
 RUN { echo 'export PATH=/opt/conda/envs/tilert/bin:/opt/conda/bin:$PATH'; \
