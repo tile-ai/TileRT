@@ -1,15 +1,22 @@
-# Runtime dependencies for the v0.1.5 wheel, pinned to the exact ABI the
-# wheel was built against. ``torch`` must be installed from PyTorch's cu130
-# index — PyPI's default ``torch`` is a different CUDA build and will not load
-# the cu130-linked tilert binary:
+# Runtime dependencies of the v0.1.6 wheel. The wheel carries backends for two
+# torch ABIs (hence the range below), so install the torch build that matches
+# your GPUs first:
 #
+#   # NVIDIA (DeepSeek-V3.2, GLM-5/5.1): PyTorch's cu130 build. PyPI's default
+#   # ``torch`` is a different CUDA build and will not load the cu130-linked
+#   # tilert binaries.
 #   pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.11.0
+#
+#   # AMD (GLM-5.2/5.3): torch==2.12.0+rocm7.14.0, preinstalled in the ROCm image
+#   # (ghcr.io/tile-ai/tilert-rocm-decode:0.1.6).
+#
 #   pip install -r requirements.txt
 #
-# The recommended path remains the prebuilt Docker image (see README).
-torch==2.11.0
+# The recommended path remains the prebuilt Docker images (see README).
+torch>=2.11,<2.13
 transformers>=4.46.3
 tokenizers>=0.20.3
+safetensors
 numpy
 scipy
 einops

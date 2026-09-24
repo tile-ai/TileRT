@@ -38,4 +38,17 @@ per-file-ignores =
     # pd_vllm implements vLLM connector / abstract-profile interfaces, so many
     # method params are unused by design (U100); black collapses the ``...``
     # interface stubs onto one line (E704).
-    tilert/pd_vllm/*:U100,E704
+    #
+    # Since v0.1.6 the Python sources are recovered from the published wheel,
+    # which ships them without comments: per-line noqa's are not available and
+    # long string literals would need code edits to re-wrap. The remaining codes
+    # on the pd_vllm line and the entries below relax those checks per exported
+    # path instead. flake8 applies only the longest matching pattern, so each
+    # entry repeats the codes it still needs (e.g. F401 for __init__.py).
+    tilert/pd_vllm/*:U100,E704,B007,D205,D209,E501,E741,F401,R501,R504,R505,SIM105,SIM115,U101,VNE002,VNE003
+    tilert/models/glm_5_2_rocm/*:E501,F401,R504,SIM113,U100,VNE002
+    tilert/models/misc_rocm/*:E501,F401,U100
+    tilert/models/base_rocm.py:E501,U100
+    tilert/__init__.py:E501,F401
+    tilert/generate.py:E501
+    tilert/utils.py:E501
